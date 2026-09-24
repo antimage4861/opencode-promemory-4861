@@ -22,7 +22,7 @@
   },
   "types": "./dist/index.d.ts",
   "bin": {
-    "promem-install": "./scripts/install.mjs"
+    "promem-install": "scripts/install.mjs"
   },
   "files": [
     "dist",
