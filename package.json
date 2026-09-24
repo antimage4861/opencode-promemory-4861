@@ -39,6 +39,7 @@
     "check": "node scripts/publish-check.mjs",
     "pack": "npm run build && npm pack",
     "install:commands": "node scripts/install.mjs",
+    "sync:deploy": "node scripts/sync-deploy.mjs",
     "release": "node scripts/github-release.mjs"
   },
   "devDependencies": {

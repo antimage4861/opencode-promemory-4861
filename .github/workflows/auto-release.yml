@@ -1,0 +1,60 @@
+name: Auto Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 读取 package.json 版本
+        id: version
+        run: |
+          VER=$(node -p "require('./package.json').version")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VER" >> "$GITHUB_OUTPUT"
+
+      - name: 检查 tag 是否已存在
+        id: tag
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 生成 Release 说明(CHANGELOG 首节)
+        id: body
+        run: |
+          BODY=$(python3 - <<'EOF'
+          import re
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          ver = "${{ steps.version.outputs.version }}"
+          # 取该版本标题到下个标题之间的内容
+          m = re.search(r"^#\s+" + re.escape(ver) + r"\s*.*?\n(.*?)(?=^#\s+|\Z)", text, re.M | re.S)
+          if m:
+              print(m.group(1).strip())
+          else:
+              print("自动发布 ${{ steps.version.outputs.version }}")
+          EOF
+          )
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BODY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: 创建 tag 和 Release
+        if: steps.tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body: ${{ steps.body.outputs.body }}
+          generate_release_notes: false
