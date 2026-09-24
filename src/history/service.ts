@@ -8,13 +8,14 @@ export interface HistoryHit {
   message_id: string
   time_created: number
   tool_name?: string
+  project_id?: string
   snippet: string
   score: number
 }
 
 export function searchHistory(
   db: Db,
-  input: { query: string; session_id?: string; limit?: number; scoreFloor?: number },
+  input: { query: string; session_id?: string; project_id?: string; limit?: number; scoreFloor?: number },
 ): HistoryHit[] {
   const limit = input.limit ?? 10
   const ftsQuery = buildFtsQuery(input.query)
@@ -27,11 +28,15 @@ export function searchHistory(
     conditions.push("history_fts.session_id = ?")
     params.push(input.session_id)
   }
+  if (input.project_id) {
+    conditions.push("history_fts.project_id = ?")
+    params.push(input.project_id)
+  }
   const whereClause = conditions.length > 0 ? `AND ${conditions.join(" AND ")}` : ""
 
   const sql = `
     SELECT history_fts.part_id, history_fts.session_id, history_fts.message_id,
-           history_fts.time_created, history_fts.tool_name, history_fts.body,
+           history_fts.time_created, history_fts.tool_name, history_fts.project_id, history_fts.body,
            bm25(history_fts_idx) AS score
     FROM history_fts_idx
     JOIN history_fts ON history_fts.rowid = history_fts_idx.rowid
@@ -47,6 +52,7 @@ export function searchHistory(
     message_id: string
     time_created: number
     tool_name: string | null
+    project_id: string | null
     body: string
     score: number
   }>(sql, ftsQuery, ...params, fetchLimit)
@@ -56,6 +62,7 @@ export function searchHistory(
     message_id: r.message_id,
     time_created: r.time_created,
     tool_name: r.tool_name ?? undefined,
+    project_id: r.project_id ?? undefined,
     snippet: extractSnippet(r.body, input.query),
     score: -r.score,
   }))
@@ -65,9 +72,13 @@ export function searchHistory(
   return mapped.filter((r, i) => i === 0 || r.score >= cutoff).slice(0, limit)
 }
 
-export function getHistoryPart(db: Db, part_id: string): { body: string } | null {
-  const row = db.get<{ body: string }>("SELECT body FROM history_fts WHERE part_id = ?", part_id)
-  return row ?? null
+export function getHistoryPart(db: Db, part_id: string): { body: string; project_id?: string } | null {
+  const row = db.get<{ body: string; project_id: string | null }>(
+    "SELECT body, project_id FROM history_fts WHERE part_id = ?",
+    part_id,
+  )
+  if (!row) return null
+  return { body: row.body, project_id: row.project_id ?? undefined }
 }
 
 export function partsFromMessage(message: {

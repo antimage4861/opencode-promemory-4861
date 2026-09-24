@@ -2,12 +2,13 @@ import { tool } from "@opencode-ai/plugin"
 import type { Db } from "../memory/db.ts"
 import { searchMemory } from "../memory/service.ts"
 
-export function createMemoryTool(deps: { db: () => Db; reconcile: () => void; scoreFloor: () => number }) {
+export function createMemoryTool(deps: { db: () => Db; reconcile: () => void; scoreFloor: () => number; getProjectId: () => string | null }) {
   return tool({
     description: [
       "检索项目的策展记忆（checkpoint / notes / MEMORY.md 的 BM25 搜索）。",
       "何时用：需要回忆早前会话沉淀的结论、决策、精确配置时。",
       "用法：给 1-2 个独特词（函数名/ID/术语）最有效；0 结果不代表没记录过，参考返回中的升级指引，或改用 history 工具回溯原文。",
+      "默认检索当前项目的策展记忆（projects/<pid>）。跨项目需显式传 scope/scope_id。",
     ].join("\n"),
     args: {
       operation: tool.schema.enum(["search"]).optional().describe("操作，默认 search"),
@@ -19,10 +20,13 @@ export function createMemoryTool(deps: { db: () => Db; reconcile: () => void; sc
     },
     async execute(args) {
       deps.reconcile()
+      const pid = deps.getProjectId()
+      const scope = args.scope ?? (pid ? "projects" : undefined)
+      const scope_id = args.scope_id ?? (scope === "projects" ? (pid ?? undefined) : args.scope_id)
       const results = searchMemory(deps.db(), {
         query: args.query,
-        scope: args.scope,
-        scope_id: args.scope_id,
+        scope,
+        scope_id,
         type: args.type,
         limit: args.limit,
         scoreFloor: deps.scoreFloor(),

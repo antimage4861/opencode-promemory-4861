@@ -1,6 +1,6 @@
 {
   "name": "opencode-promemory-4861",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "OpenCode 项目记忆插件:跨会话自动沉淀 checkpoint、BM25 检索策展记忆与历史原文、孤儿会话接管。",
   "keywords": [
     "opencode",

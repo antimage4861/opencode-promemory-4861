@@ -12,8 +12,10 @@ import {
   deleteMirrorMessage,
   deleteMirrorSession,
   catchupHistory,
+  backfillProjectIds,
 } from "./history/mirror.ts"
 import { partsFromMessage } from "./history/service.ts"
+import { resolveProjectId } from "./memory/paths.ts"
 import { createMemoryTool } from "./tools/memory.ts"
 import { createHistoryTool } from "./tools/history.ts"
 import {
@@ -61,13 +63,31 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
   const blacklist = new Set<string>()
   const writerState = new Map<string, PendingWriter>()
 
+  const sessionPidCache = new Map<string, string>()
+  const getProjectId = () => (directory ? resolveProjectId(directory) : null)
+
+  async function pidForSession(sessionID: string): Promise<string | undefined> {
+    const cached = sessionPidCache.get(sessionID)
+    if (cached !== undefined) return cached || undefined
+    try {
+      const res = await client.session.get({ path: { id: sessionID } })
+      const dir = (res?.data as { directory?: string } | undefined)?.directory
+      const pid = dir ? resolveProjectId(dir) : ""
+      sessionPidCache.set(sessionID, pid)
+      return pid || undefined
+    } catch {
+      sessionPidCache.set(sessionID, "")
+      return undefined
+    }
+  }
+
   const reconcile = () => reconcileMemory(db, listFiles(memoryRoot, []))
 
   const writerDeps: WriterDeps = {
     client,
     db,
     root: memoryRoot,
-    toolsWhitelist: { memory: true, history: true },
+    toolsWhitelist: {},
     writerPrompt: WRITER_PROMPT,
     blacklist,
     projectDir: directory ?? undefined,
@@ -84,7 +104,7 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
   const sessionsProvider = async () => {
     try {
       const res = await client.session.list()
-      return (res?.data ?? []) as Array<{ id: string }>
+      return (res?.data ?? []) as Array<{ id: string; directory?: string }>
     } catch {
       return []
     }
@@ -124,8 +144,14 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
   void sessionsProvider().then(async (sessions) => {
     for (const s of sessions) {
       recordActivity(s.id)
+      if (s.directory) sessionPidCache.set(s.id, resolveProjectId(s.directory))
     }
     if (cfg.disableWrite) return
+    try {
+      backfillProjectIds(historyDb, sessions)
+    } catch {
+      // 存量回填失败不阻塞插件
+    }
     try {
       await catchupHistory(historyDb, client, sessions, blacklist)
     } catch {
@@ -150,10 +176,12 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
         db: () => db,
         reconcile: () => reconcile(),
         scoreFloor: () => cfg.searchScoreFloor,
+        getProjectId,
       }),
       history: createHistoryTool({
         db: () => historyDb,
         scoreFloor: () => cfg.searchScoreFloor,
+        getProjectId,
       }),
     },
     "experimental.session.compacting": async (input) => {
@@ -217,19 +245,24 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
           const res = await client.session.message({ path: { id: info.sessionID, messageID } })
           const message = res.data as { info?: { id?: string }; parts?: Array<{ id?: string; type?: string; text?: string }> }
           if (!message) return
+          const project_id = await pidForSession(info.sessionID)
           const parts = partsFromMessage(message as never, info.sessionID)
-          for (const p of parts) upsertMirrorPart(historyDb, p)
+          for (const p of parts) upsertMirrorPart(historyDb, { ...p, project_id })
         } catch {
           return
         }
       } else if (event.type === "message.removed") {
         const info = event.properties?.info as { sessionID?: string; id?: string } | undefined
         if (info?.sessionID && info.id) deleteMirrorMessage(historyDb, info.sessionID, info.id)
+      } else if (event.type === "session.updated") {
+        const info = event.properties?.info as { id?: string; directory?: string } | undefined
+        if (info?.id && info.directory) sessionPidCache.set(info.id, resolveProjectId(info.directory))
       } else if (event.type === "session.deleted") {
         const info = event.properties?.info as { id?: string } | undefined
         if (info?.id) {
           deleteMirrorSession(historyDb, info.id)
           blacklist.delete(info.id)
+          sessionPidCache.delete(info.id)
         }
       }
     },

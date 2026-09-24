@@ -1,3 +1,11 @@
+# 0.3.0 (2026-09-24)
+
+- **项目隔离(根治互串)**:给 history 原文镜像加 `project_id` 维度,`memory` / `history` 检索默认限定当前项目,杜绝跨项目内容污染与回溯拿错。
+  - `history_fts` 新增 `project_id` 列,写入时按会话所属项目目录哈希定位(内存缓存 + `session.get` 懒查);存量数据启动时 `backfillProjectIds` 回填,已删除会话标 NULL。
+  - `history` search 默认过滤当前项目 pid,`get` 校验 part 归属、跨项目拒绝读取。
+  - `memory` search 未显式传 `scope_id` 时兜底为当前项目 `projects/<pid>`。
+  - 蒸馏子会话工具白名单收紧为空:writer 只依赖增量原文,不再暴露检索工具,消除蒸馏污染路径。
+
 # 0.2.0 (2026-09-24)
 
 - **重大修复:v1/v2 插件系统兼容**。opencode 1.18 双轨插件系统确认:`opencode.json` 的 `plugin` 数组(npm 包)走 v2 加载器,只接受 `export default { id, effect|setup }`;v1 格式(具名导出)放入会**静默失败**(无日志、无工具、无报错)。

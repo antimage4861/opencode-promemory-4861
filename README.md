@@ -124,20 +124,22 @@ memory/
 三层结构,各司其职:
 
 **1. 采集层(base:历史镜像)**
-`message.updated` 事件把每次完整消息的文本 parts 写入 `history.db` 的 `history_fts` 表格,配 `history_fts_idx` 虚拟表做 FTS5 索引;`message.removed`/`session.deleted` 同步删除。启动时 `catchupHistory` 补偿补拉历史消息。中文分词靠 `cjkSpace()`:在连续汉字间插空格,配合 FTS5 按空格分词,实现中文 BM25 近似检索。
+`message.updated` 事件把每次完整消息的文本 parts 写入 `history.db` 的 `history_fts` 表格,配 `history_fts_idx` 虚拟表做 FTS5 索引;写入时带 `project_id`(会话所属项目目录的 sha256 pid,经内存缓存 + 懒查 `session.get` 定位);`message.removed`/`session.deleted` 同步删除。启动时 `catchupHistory` 补偿补拉历史消息,并对存量数据 `backfillProjectIds` 回填 `project_id`(已删除会话无法回填的标 NULL)。中文分词靠 `cjkSpace()`:在连续汉字间插空格,配合 FTS5 按空格分词,实现中文 BM25 近似检索。
 
 **2. 沉淀层(writer:值蒸馏)**
-核心是 `runWriter` → `settleWriter`:为一个会话挑选上次 checkpoint 之后的增量消息,拼接蒸馏提示词(`writer-prompt`,已内联在 bundle 中)派发**子会话**执行,子会话只允许调用 `memory` / `history` 工具、被强制输出结构化 markdown(checkpoint 格式,含 Summary/Decisions/Facts/Open/Files/Notes)。宿主侧校验结果(必含各 section、≤10KB、防空白过多/垃圾文本),通过后写入 `sessions/<id>/checkpoint.md` 并**追加**项目 `MEMORY.md`,同时记录 `scanner:<sid>` 水位。触发通道有三个:空闲自动 / 压缩前 / 手动命令。若子会话中途退出,写 `.writers.json` 留下孤儿记录,下次启动由 `settleStartupOrphans` 接管补齐(只跳过 status 为 busy/retry 的仍在运行会话)。
+核心是 `runWriter` → `settleWriter`:为一个会话挑选上次 checkpoint 之后的增量消息,拼接蒸馏提示词(`writer-prompt`,已内联在 bundle 中)派发**子会话**执行,子会话**不暴露任何工具**(只依赖增量原文,防止检索到其他项目内容污染本项目记忆)、被强制输出结构化 markdown(checkpoint 格式,含 Summary/Decisions/Facts/Open/Files/Notes)。宿主侧校验结果(必含各 section、≤10KB、防空白过多/垃圾文本),通过后写入 `sessions/<id>/checkpoint.md` 并**追加**项目 `MEMORY.md`,同时记录 `scanner:<sid>` 水位。触发通道有三个:空闲自动 / 压缩前 / 手动命令。若子会话中途退出,写 `.writers.json` 留下孤儿记录,下次启动由 `settleStartupOrphans` 接管补齐(只跳过 status 为 busy/retry 的仍在运行会话)。
 
 **3. 检索层(tools:BM25)**
 `memory` / `history` 两个自定义工具,统一走 FTS5 `bm25()` 排序、`scoreFloor` 相对阈值过滤、`extractSnippet` 按命中关键词切片做上下文片段。返回片段的定位(path / session_id / part_id)让 agent 能用 `read` 或 `history get` 取全文。
+**项目隔离**:`memory` 未显式传 `scope_id` 时默认检索当前项目的 `projects/<pid>`;`history` 未显式传 `project_id` 时默认限定当前项目 pid,`history get` 也会校验 part 归属、跨项目拒绝读取。跨项目检索需显式传 `scope_id`/`project_id`(或 `session_id` 限定单会话)。
 
 **工程决策(踩坑沉淀)**
 
 - **拦截必须原地改 parts**:`command.execute.before` 的 `output.parts = [...]` 整体赋值在 headless `run --command` 下不生效(agent 收到的是命令模板原文照常执行整合),必须 `output.parts.splice(0, len, {type:"text", text:...})` 原地替换。
 - **孤儿判断只看 busy/retry**:曾用 `status.type !== "idle"` 判断,但已完成会话 status 端点返回 `undefined`,`undefined !== "idle"` 恒真导致孤儿永远被跳过,浪费一个子会话。改为只对 busy/retry 跳过。
 - **`resolveProjectId` 用 sha256(projectDir)**:bun 与 node 对 SHA-256 有细微输入差异(如截断),跨运行时会导致 pid 不同而记忆散落两个文件。插件统一在 bun 运行时内自洽,无此问题。
-- **权限收紧**:子会话工具白名单仅 `memory` / `history`,防止蒸馏过程中被诱导去读写任意文件。
+- **权限收紧**:子会话工具白名单为空(不暴露 `memory`/`history`),蒸馏只依赖增量原文,杜绝检索到其他项目内容污染本项目记忆。
+- **项目隔离靠默认 pid**:`memory`/`history` 都默认限定当前项目 pid(经 `session.list` 预热 + `session.get` 懒查的 pid 缓存),避免跨项目互串;存量历史启动时回填 `project_id`。
 
 ---
 
