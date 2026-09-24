@@ -152,6 +152,8 @@ npm run check        # 发布前校验(dist 产物 / name / main / files / licen
 npm pack             # 生成 tarball,验证包内容
 ```
 
+`deploy/opencode-plugin/` 是本插件的**生产部署形态**(分模块 TS 源 + 顶层入口,与 npm 包的单文件 bundle 不同),同步自 `.opencode/plugins/` 部署目录,可用 v1 本地插件方式直接拷贝使用。改动源码时两处需同步:本仓库 `src/`(打包发布)与 `deploy/opencode-plugin/`(生产运行)。
+
 目录结构:
 
 ```
