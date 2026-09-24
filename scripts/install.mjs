@@ -5,7 +5,8 @@ import path from "node:path"
 import os from "node:os"
 import { fileURLToPath } from "node:url"
 
-const PLUGIN_COMMAND_DIR = path.join(fileURLToPath(new URL("../", import.meta.url)), "src", "command")
+const pkgRoot = fileURLToPath(new URL("../", import.meta.url))
+const PLUGIN_COMMAND_DIR = path.join(pkgRoot, "dist", "command")
 
 const DEFAULT_COMMAND_DIR = path.join(os.homedir(), ".config", "opencode", "command")
 const CANDIDATES = process.env.OPENCODE_CONFIG_DIR

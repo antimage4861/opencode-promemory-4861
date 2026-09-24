@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises"
+import { mkdir, writeFile, copyFile, readdir } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import { build } from "esbuild"
 
@@ -28,4 +28,11 @@ export declare const ProjectMemoryPlugin: Plugin
   "utf8",
 )
 
-console.log("✓ dist/index.js + dist/index.d.ts 生成")
+const commandOut = DIST + "/command"
+await mkdir(commandOut, { recursive: true })
+const commandSrc = dirname + "src/command"
+for (const f of await readdir(commandSrc)) {
+  if (f.endsWith(".md")) await copyFile(commandSrc + "/" + f, commandOut + "/" + f)
+}
+
+console.log("✓ dist/index.js + dist/index.d.ts + dist/command/*.md 生成")

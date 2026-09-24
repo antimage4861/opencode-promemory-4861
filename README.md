@@ -12,34 +12,30 @@ OpenCode 项目记忆插件:跨会话自动沉淀 checkpoint、BM25(FTS5)检索�
 
 ## 安装
 
-opencode 插件加载两种方式,任选其一。
+> **重要**:本插件采用 opencode 1.18 的 **v1 插件 API**(具名导出 + 事件/工具/命令钩子)。opencode 1.18 存在双轨插件系统——`opencode.json` 的 `plugin` 数组(npm 包)一律走 **v2 加载器**,只接受 `export default { id, effect|setup }`,v1 格式插件放入会**静默失败**(无报错、无日志、工具不出现)。因此**不要**用 `plugin: ["opencode-promemory-4861"]` 方式安装。正确方式是把插件文件放进本地插件目录,由 v1 加载器自动发现。
 
-### 方式 A:npm 包(推荐,面向使用方)
+### 方式一:项目级(推荐)
+
+把 `dist/index.js` 复制为项目插件文件(重命名为 `.js` 便于 v1 链识别):
 
 ```bash
-# 在项目根目录执行(npm 会自动写入 package.json,亦可手动):
-npm i opencode-promemory-4861
+# 用 npm 包内的构建产物
+cp node_modules/opencode-promemory-4861/dist/index.js .opencode/plugins/project-memory.js
+# 或直接从本仓库
+cp dist/index.js .opencode/plugins/project-memory.js
 ```
 
-在 `opencode.json`(或 `opencode.jsonc`)中注册:
+重启 opencode 后即自动加载。`memory` / `history` 工具会出现在会话工具列表中。
 
-```json
-{
-  "plugin": ["opencode-promemory-4861"]
-}
+### 方式二:全局
+
+同样操作,放到全局插件目录(对所有项目生效):
+
+```bash
+cp node_modules/opencode-promemory-4861/dist/index.js ~/.config/opencode/plugins/project-memory.js
 ```
 
-启动 opencode 后即自动加载。(Bun 会将 npm 包及其依赖缓存到 `~/.cache/opencode/node_modules/`。)
-
-### 方式 B:本地路径(面向开发/自用)
-
-克隆本仓库后,在 `opencode.json` 中:
-
-```json
-{
-  "plugin": ["/绝对路径/到/opencode-promemory-4861/dist/index.js"]
-}
-```
+> 注:`.opencode/plugins/` 与 `~/.config/opencode/plugins/`(复数)是 v1 链自动发现的目录。若同时存在多个来源会各自独立加载,建议只用一个。
 
 ---
 
@@ -54,7 +50,7 @@ npx promem-install
 npm i -g opencode-promemory-4861 && promem-install
 ```
 
-手动复制亦可(模板在仓库 `src/command/*.md`):
+模板随 npm 包内的 `dist/command/*.md` 分发,脚本自动定位。手动复制亦可(模板在仓库 `dist/command/*.md`):
 
 ```
 mem-checkpoint.md  mem-dream.md  mem-distill.md  mem-search.md
@@ -149,7 +145,7 @@ memory/
 
 ```bash
 npm install          # 安装 esbuild / @opencode-ai/plugin / typescript
-npm run build        # esbuild 打包 → dist/index.js + dist/index.d.ts(单文件,43.8KB)
+npm run build        # esbuild 打包 → dist/index.js + dist/index.d.ts + dist/command/*.md
 npm run check        # 发布前校验(dist 产物 / name / main / files / license)
 npm pack             # 生成 tarball,验证包内容
 ```
