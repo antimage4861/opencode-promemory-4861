@@ -38,7 +38,8 @@
     "build": "node scripts/build.mjs",
     "check": "node scripts/publish-check.mjs",
     "pack": "npm run build && npm pack",
-    "install:commands": "node scripts/install.mjs"
+    "install:commands": "node scripts/install.mjs",
+    "release": "node scripts/github-release.mjs"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.9",
