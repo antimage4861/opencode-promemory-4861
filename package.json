@@ -1,0 +1,52 @@
+{
+  "name": "opencode-promemory-4861",
+  "version": "0.1.0",
+  "description": "OpenCode 项目记忆插件:跨会话自动沉淀 checkpoint、BM25 检索策展记忆与历史原文、孤儿会话接管。",
+  "keywords": [
+    "opencode",
+    "plugin",
+    "memory",
+    "context",
+    "checkpoint",
+    "bm25",
+    "fts5"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "promem-install": "./scripts/install.mjs"
+  },
+  "files": [
+    "dist",
+    "scripts/install.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "node scripts/publish-check.mjs",
+    "pack": "npm run build && npm pack",
+    "install:commands": "node scripts/install.mjs"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.9",
+    "@types/node": "^26.6.2",
+    "bun-types": "^1.4.2",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.5.0"
+  },
+  "allowScripts": {
+    "esbuild@0.24.2": true
+  }
+}
