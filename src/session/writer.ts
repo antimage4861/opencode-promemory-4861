@@ -30,6 +30,8 @@ export interface WriterDeps {
   toolsWhitelist: Record<string, boolean>
   writerPrompt: string
   blacklist: Set<string>
+  settling: Map<string, Promise<boolean>>
+  finalizing: Map<string, Promise<boolean>>
   projectDir?: string
 }
 
@@ -150,7 +152,7 @@ export function runWriter(task: WriterTarget, deps: WriterDeps, state: Map<strin
   void spawnWriter(deps, task, state)
 }
 
-export async function finalizeWriter(deps: WriterDeps, target: WriterTarget, childSessionID: string): Promise<boolean> {
+async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childSessionID: string): Promise<boolean> {
   try {
     const res = await deps.client.session.messages({ path: { id: childSessionID } })
     const messages = (res?.data ?? []) as Array<{
@@ -183,7 +185,19 @@ export async function finalizeWriter(deps: WriterDeps, target: WriterTarget, chi
   return true
 }
 
-export async function settleWriter(deps: WriterDeps, state: Map<string, PendingWriter>, childSessionID: string): Promise<boolean> {
+export function finalizeWriter(deps: WriterDeps, target: WriterTarget, childSessionID: string): Promise<boolean> {
+  const active = deps.finalizing.get(childSessionID)
+  if (active) return active
+  const task = finalizeWriterOnce(deps, target, childSessionID)
+  deps.finalizing.set(childSessionID, task)
+  const clear = () => {
+    if (deps.finalizing.get(childSessionID) === task) deps.finalizing.delete(childSessionID)
+  }
+  void task.then(clear, clear)
+  return task
+}
+
+async function settleWriterOnce(deps: WriterDeps, state: Map<string, PendingWriter>, childSessionID: string): Promise<boolean> {
   let pending: PendingWriter | undefined
   for (const [, p] of state) {
     if (p.childSessionID === childSessionID && !p.done) {
@@ -199,6 +213,18 @@ export async function settleWriter(deps: WriterDeps, state: Map<string, PendingW
   pending.done = true
   state.delete(pending.target.sessionID)
   return finalizeWriter(deps, pending.target, childSessionID)
+}
+
+export function settleWriter(deps: WriterDeps, state: Map<string, PendingWriter>, childSessionID: string): Promise<boolean> {
+  const active = deps.settling.get(childSessionID)
+  if (active) return active
+  const task = settleWriterOnce(deps, state, childSessionID)
+  deps.settling.set(childSessionID, task)
+  const clear = () => {
+    if (deps.settling.get(childSessionID) === task) deps.settling.delete(childSessionID)
+  }
+  void task.then(clear, clear)
+  return task
 }
 
 export function expireWriters(deps: WriterDeps, state: Map<string, PendingWriter>, timeoutMs: number): void {
@@ -217,10 +243,14 @@ export function checkpointPath(root: string, sessionID: string): string {
 
 export function appendProjectMemory(root: string, projectDir: string | undefined, body: string): boolean {
   if (!projectDir) return false
+  const normalizedBody = body.trim()
+  if (!normalizedBody) return false
   const pid = resolveProjectId(projectDir)
   const p = buildPath({ root, scope: "projects", scope_id: pid, key: "MEMORY" })
   const existing = readMemoryFile(p) ?? ""
-  const merged = existing ? `${existing}\n\n${body}` : body
+  const normalizedExisting = existing.trimEnd()
+  if (normalizedExisting === normalizedBody || normalizedExisting.endsWith(`\n\n${normalizedBody}`)) return true
+  const merged = existing ? `${existing}\n\n${normalizedBody}` : normalizedBody
   return writeMemoryFile(p, merged).ok
 }
 

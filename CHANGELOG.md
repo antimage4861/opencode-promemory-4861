@@ -1,3 +1,12 @@
+# 0.3.1 (2026-09-26)
+
+- **修复:同一 writer 子会话并发结算导致项目记忆重复追加**。`session.idle` / `session.status` / scanner 三通道可同时结算同一子会话,落盘两份相同 checkpoint。
+  - 结算与收尾按 `childSessionID` single-flight(`settling` / `finalizing` 两张 in-flight 表),重复触发共享同一次执行。
+  - `appendProjectMemory` 增加尾部内容去重:待写内容与已有末尾相同时不再二次写入。
+  - 启动时孤儿接管改为走 `settleWriter`,不再绕过 single-flight 直接 finalize。
+- **修复:同一路径生成两个项目 ID**。Bun 与 Node 传入的仓库路径分隔符不同(`D:\RMANBAK` 与 `D:/RMANBAK`),hash 不同导致记忆分裂为两个项目目录。`resolveProjectId` 现统一分隔符后再哈希,两种运行时得到同一 ID。
+- **新增测试**:`npm test`(`bun test`)纳入 scripts,覆盖并发结算、晚到孤儿、重复去重、路径规范化 4 个用例。
+
 # 0.3.0 (2026-09-24)
 
 - **项目隔离(根治互串)**:给 history 原文镜像加 `project_id` 维度,`memory` / `history` 检索默认限定当前项目,杜绝跨项目内容污染与回溯拿错。

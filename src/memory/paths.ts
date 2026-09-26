@@ -51,5 +51,6 @@ export function buildPath(input: { root: string; scope: Scope; scope_id?: string
 }
 
 export function resolveProjectId(absRepoPath: string): string {
-  return createHash("sha256").update(absRepoPath).digest("hex").slice(0, 12)
+  const normalized = path.posix.normalize(absRepoPath.replace(/\\/g, "/"))
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 12)
 }
