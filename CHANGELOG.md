@@ -1,3 +1,17 @@
+# 0.4.0 (2026-09-27)
+
+- **BREAKING:移除「1h 空闲自动沉淀」通道**。checkpoint 触发通道由三个收敛为两个:**压缩前自动沉淀** / **手动 `/mem-checkpoint`**。
+  - 持续活跃的会话本就拿不到空闲沉淀(活动刷新导致永不满足 1h 空闲),而空闲会话的沉淀质量与压缩前、手动触发同源,收益不足以支撑一条常驻定时器。
+  - 删除 `startScanner` / `scanSessions` / `shouldCheckpoint` 与 `activityCache`(`scanner.ts` 仅剩过期清理,重命名为 `retention.ts`)。
+  - **BREAKING:删除配置项** `PROJECT_MEMORY_IDLE_CHECKPOINT_TIMEOUT_MS` 与 `PROJECT_MEMORY_IDLE_CHECK_INTERVAL_MS`,设置后不再生效。
+  - 保留不变:`session.idle` / `session.status` 结算事件、启动孤儿接管、`retentionTimer`。
+  - 存量数据不受影响:`memory_meta` 的 `scanner:<sid>` 水位键名保持不变(改名会孤立 236 条历史水位)。
+- `/mem-dream`、`/mem-distill` 维持原设计:**手动触发 + 7 / 30 天冷却拦截**,本次不引入自动调度。
+- **BREAKING:取消记忆文件体积上限**。`writeMemoryFile` 原先对所有记忆文件套用 `10KB / 200 行` 单条上限,而 `projects/<pid>/MEMORY.md` 是累积型文件,超限后 `size-exceeded` 被拒且调用方丢弃返回值,导致项目记忆静默永久停止追加。
+  - 删除 `MAX_FILE_BYTES` / `MAX_FILE_LINES` 与 `WriteResult` 的 `size-exceeded`;`disable_write` 与 IO 错误语义不变。
+  - 单条 checkpoint 的 10KB 蒸馏约束仍在 `validateCheckpoint` 中保留(它约束的是单次蒸馏质量,与累积上限性质不同)。
+  - 实测:本次 checkpoint 正文 5783 字节,而 `MEMORY.md` 已 11021 字节,合并后 16806 字节必然被拒 —— 这正是 0.3.1 以来 236 个会话批量结算一个字都没写进项目记忆的原因。
+
 # 0.3.1 (2026-09-26)
 
 - **修复:同一 writer 子会话并发结算导致项目记忆重复追加**。`session.idle` / `session.status` / scanner 三通道可同时结算同一子会话,落盘两份相同 checkpoint。

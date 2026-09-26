@@ -29,12 +29,7 @@ import {
   type WriterDeps,
   type WriterTarget,
 } from "./project-memory/src/session/writer.ts"
-import {
-  recordActivity,
-  startScanner,
-  cleanupExpiredSessions,
-  type ScanDeps,
-} from "./project-memory/src/session/scanner.ts"
+import { cleanupExpiredSessions } from "./project-memory/src/session/retention.ts"
 import { createCompactionHandler } from "./project-memory/src/session/compaction-hook.ts"
 import { resolveConfig, asMemoryPluginOptions, type MemoryPluginConfig } from "./project-memory/src/config.ts"
 
@@ -93,14 +88,6 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
     projectDir: directory ?? undefined,
   }
 
-  const scanDeps: ScanDeps = {
-    ...writerDeps,
-    db,
-    idleCheckpointTimeoutMs: cfg.idleCheckpointTimeoutMs,
-    idleCheckIntervalMs: cfg.idleCheckIntervalMs,
-    writeEnabled: !cfg.disableWrite,
-  }
-
   const sessionsProvider = async () => {
     try {
       const res = await client.session.list()
@@ -109,8 +96,6 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
       return []
     }
   }
-
-  const scanner = startScanner(scanDeps, writerState, sessionsProvider)
 
   const compactionHandler = createCompactionHandler(
     {
@@ -142,7 +127,6 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
 
   void sessionsProvider().then(async (sessions) => {
     for (const s of sessions) {
-      recordActivity(s.id)
       if (s.directory) sessionPidCache.set(s.id, resolveProjectId(s.directory))
     }
     if (cfg.disableWrite) return
@@ -234,7 +218,6 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
           | { sessionID?: string; id?: string; time?: { completed?: number } }
           | undefined
         if (!info?.sessionID) return
-        recordActivity(info.sessionID)
         if (cfg.disableWrite) return
         if (blacklist.has(info.sessionID)) return
         if (!info.time?.completed) return
@@ -266,7 +249,6 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
       }
     },
     dispose: async () => {
-      scanner.stop()
       clearInterval(retentionTimer)
     },
   }

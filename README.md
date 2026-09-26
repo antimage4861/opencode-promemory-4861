@@ -74,7 +74,6 @@ mem-checkpoint.md  mem-dream.md  mem-distill.md  mem-search.md
 
 自动行为(事件驱动,无需操作):
 
-- **空闲沉淀**:会话进入 `idle` 且空闲超过 `IDLE_CHECKPOINT_TIMEOUT_MS`(默认 1 小时),自动 checkpoint。
 - **压缩前沉淀**:会话 compaction 前若有未沉淀增量,自动先沉淀。
 - **孤儿接管**:若某次蒸馏/整合子会话中途退出,留空的 checkpoint 由下个会话启动时自动补齐、写入并清理。
 
@@ -88,8 +87,6 @@ mem-checkpoint.md  mem-dream.md  mem-distill.md  mem-search.md
 | --- | --- | --- |
 | `PROJECT_MEMORY_DISABLE_WRITE` | `false` | 设为 `true` 只读:关闭所有写入(自动沉淀/整合/命令全停,仅保留检索) |
 | `PROJECT_MEMORY_WRITER_TIMEOUT_MS` | `120000` | 子会话蒸馏超时 |
-| `PROJECT_MEMORY_IDLE_CHECKPOINT_TIMEOUT_MS` | `3600000` | 空闲多久触发 checkpoint(1 小时) |
-| `PROJECT_MEMORY_IDLE_CHECK_INTERVAL_MS` | `600000` | 空闲扫描间隔(10 分钟) |
 | `PROJECT_MEMORY_RETENTION_DAYS` | `0` | 会话 checkpoint 保留天数,`0` = 不清理 |
 | `PROJECT_MEMORY_RECONCILE_ON_SEARCH` | `true` | 检索前是否重建文件索引 |
 | `PROJECT_MEMORY_SEARCH_SCORE_FLOOR` | `0.15` | BM25 分数阈值(相对最佳命中的比例) |
@@ -127,7 +124,7 @@ memory/
 `message.updated` 事件把每次完整消息的文本 parts 写入 `history.db` 的 `history_fts` 表格,配 `history_fts_idx` 虚拟表做 FTS5 索引;写入时带 `project_id`(会话所属项目目录的 sha256 pid,经内存缓存 + 懒查 `session.get` 定位);`message.removed`/`session.deleted` 同步删除。启动时 `catchupHistory` 补偿补拉历史消息,并对存量数据 `backfillProjectIds` 回填 `project_id`(已删除会话无法回填的标 NULL)。中文分词靠 `cjkSpace()`:在连续汉字间插空格,配合 FTS5 按空格分词,实现中文 BM25 近似检索。
 
 **2. 沉淀层(writer:值蒸馏)**
-核心是 `runWriter` → `settleWriter`:为一个会话挑选上次 checkpoint 之后的增量消息,拼接蒸馏提示词(`writer-prompt`,已内联在 bundle 中)派发**子会话**执行,子会话**不暴露任何工具**(只依赖增量原文,防止检索到其他项目内容污染本项目记忆)、被强制输出结构化 markdown(checkpoint 格式,含 Summary/Decisions/Facts/Open/Files/Notes)。宿主侧校验结果(必含各 section、≤10KB、防空白过多/垃圾文本),通过后写入 `sessions/<id>/checkpoint.md` 并**追加**项目 `MEMORY.md`,同时记录 `scanner:<sid>` 水位。触发通道有三个:空闲自动 / 压缩前 / 手动命令。若子会话中途退出,写 `.writers.json` 留下孤儿记录,下次启动由 `settleStartupOrphans` 接管补齐(只跳过 status 为 busy/retry 的仍在运行会话)。
+核心是 `runWriter` → `settleWriter`:为一个会话挑选上次 checkpoint 之后的增量消息,拼接蒸馏提示词(`writer-prompt`,已内联在 bundle 中)派发**子会话**执行,子会话**不暴露任何工具**(只依赖增量原文,防止检索到其他项目内容污染本项目记忆)、被强制输出结构化 markdown(checkpoint 格式,含 Summary/Decisions/Facts/Open/Files/Notes)。宿主侧校验结果(必含各 section、≤10KB、防空白过多/垃圾文本),通过后写入 `sessions/<id>/checkpoint.md` 并**追加**项目 `MEMORY.md`,同时记录 `scanner:<sid>` 水位。触发通道有两个:压缩前 / 手动命令。若子会话中途退出,写 `.writers.json` 留下孤儿记录,下次启动由 `settleStartupOrphans` 接管补齐(只跳过 status 为 busy/retry 的仍在运行会话)。
 
 **3. 检索层(tools:BM25)**
 `memory` / `history` 两个自定义工具,统一走 FTS5 `bm25()` 排序、`scoreFloor` 相对阈值过滤、`extractSnippet` 按命中关键词切片做上下文片段。返回片段的定位(path / session_id / part_id)让 agent 能用 `read` 或 `history get` 取全文。
@@ -162,7 +159,7 @@ src/
 ├── config.ts                # 配置解析:代码内配置 > env > 默认值
 ├── memory/                  # 策展记忆:db 包装、FTS5 索引、路径解析、BM25 检索、文件存储
 ├── history/                 # 历史镜像:FTS5 索引、检索、消息→parts 拆解
-├── session/                 # 沉淀核心:writer(蒸馏/追加/占位)、scanner(空闲)、compaction-hook、validator、prompt(内联)
+├── session/                 # 沉淀核心:writer(蒸馏/追加/占位)、compaction-hook、retention(过期清理)、validator、prompt(内联)
 ├── tools/                   # memory / history 工具定义
 └── command/                 # 4 个斜杠命令模板(随包分发)
 ```
