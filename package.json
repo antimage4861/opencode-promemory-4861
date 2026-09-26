@@ -36,6 +36,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "test": "bun test",
     "check": "node scripts/publish-check.mjs",
     "pack": "npm run build && npm pack",
     "install:commands": "node scripts/install.mjs",

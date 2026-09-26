@@ -23,11 +23,8 @@ import {
   expireWriters,
   runWriter,
   persistOrphan,
-  removeOrphan,
-  findOrphan,
   listOrphans,
   expireOrphans,
-  finalizeWriter,
   type PendingWriter,
   type WriterDeps,
   type WriterTarget,
@@ -62,6 +59,8 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
 
   const blacklist = new Set<string>()
   const writerState = new Map<string, PendingWriter>()
+  const settlingWriters = new Map<string, Promise<boolean>>()
+  const finalizingWriters = new Map<string, Promise<boolean>>()
 
   const sessionPidCache = new Map<string, string>()
   const getProjectId = () => (directory ? resolveProjectId(directory) : null)
@@ -90,6 +89,8 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
     toolsWhitelist: {},
     writerPrompt: WRITER_PROMPT,
     blacklist,
+    settling: settlingWriters,
+    finalizing: finalizingWriters,
     projectDir: directory ?? undefined,
   }
 
@@ -133,8 +134,7 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
         const status = entry?.[o.childSessionID] ?? Object.values(entry ?? {})[0]
         const busy = status?.type === "busy" || status?.type === "retry"
         if (busy) continue
-        await finalizeWriter(writerDeps, o.target, o.childSessionID)
-        await removeOrphan(memoryRoot, o.childSessionID)
+        await settleWriter(writerDeps, writerState, o.childSessionID)
       } catch {
         continue
       }
