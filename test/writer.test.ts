@@ -159,4 +159,21 @@ describe("writer finalization", () => {
       fs.rmSync(root, { recursive: true, force: true })
     }
   })
+
+  test("accumulates past 10KB and 200 lines", () => {
+    const root = tempRoot()
+    const projectDir = path.join(root, "project")
+    const bodies = Array.from({ length: 120 }, (_, i) =>
+      Array.from({ length: 5 }, (_, j) => `- 批次 ${i} 条目 ${j}：记忆文件是累积型产物`).join("\n"),
+    )
+    try {
+      for (const body of bodies) expect(appendProjectMemory(root, projectDir, body)).toBe(true)
+      const merged = fs.readFileSync(path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md"), "utf8")
+      expect(merged).toBe(bodies.join("\n\n"))
+      expect(Buffer.byteLength(merged, "utf8")).toBeGreaterThan(10 * 1024)
+      expect(merged.split("\n").length).toBeGreaterThan(200)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
 })

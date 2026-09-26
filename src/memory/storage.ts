@@ -2,12 +2,9 @@ import fs from "fs"
 import path from "path"
 import crypto from "crypto"
 
-export const MAX_FILE_BYTES = 10 * 1024
-export const MAX_FILE_LINES = 200
-
 export type WriteResult =
   | { ok: true }
-  | { ok: false; reason: "size-exceeded" | "write-disabled" | "io" }
+  | { ok: false; reason: "write-disabled" | "io" }
 
 export interface MemoryWriteConfig {
   memory?: {
@@ -42,10 +39,6 @@ export function statFingerprint(filePath: string): string | null {
 
 export function writeMemoryFile(filePath: string, body: string, cfg?: MemoryWriteConfig): WriteResult {
   if (!isMemoryWriteEnabled(cfg)) return { ok: false, reason: "write-disabled" }
-  const bytes = Buffer.byteLength(body, "utf8")
-  if (bytes > MAX_FILE_BYTES) return { ok: false, reason: "size-exceeded" }
-  const lineCount = body.split("\n").length
-  if (lineCount > MAX_FILE_LINES) return { ok: false, reason: "size-exceeded" }
   try {
     ensureDir(filePath)
     fs.writeFileSync(filePath, body, "utf8")
