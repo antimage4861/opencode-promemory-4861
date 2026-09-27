@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs"
 import path from "node:path"
+import { execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
@@ -49,6 +50,10 @@ for (const rel of SHARED_REL) {
   }
 }
 
+// The top-level entry is derived from src/index.ts, not maintained by hand —
+// see scripts/gen-deploy-entry.mjs for why it used to drift silently.
+execFileSync(process.execPath, [path.join(repoRoot, "scripts", "gen-deploy-entry.mjs")], { stdio: "inherit" })
+
 console.log(`\n同步完成:${synced} 个共享文件,${changed} 个已更新,${synced - changed} 个无变化。`)
-console.log(`目标:deploy/opencode-plugin/project-memory/src(顶层 project-memory.ts 入口未改动)。`)
-if (changed === 0) console.log("两处已一致,无需提交。")
+console.log("目标:deploy/opencode-plugin/project-memory/src + 顶层 project-memory.ts 入口(由 src/index.ts 生成)")
+if (changed === 0) console.log("共享文件已一致,无需提交。")
