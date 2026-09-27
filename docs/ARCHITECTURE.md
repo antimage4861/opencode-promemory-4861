@@ -373,29 +373,21 @@ writer 能报出真实原因。
 
 | 事件 | 处理 |
 | --- | --- |
-| `session.idle` | `settleWriter` + `expireWriters` + dream 事后核对 |
-| `session.status` | `idle` 时再兜一次 |
+| `session.idle` | `expireWriters` + dream 事后核对（**不负责结算**，见下） |
 | `message.updated` | 消息完成时拉全文 parts 写 `history.db` |
 | `message.removed` | 删除镜像 |
 | `session.updated` | 更新 pid 缓存 |
 | `session.deleted` | 删镜像 + 清 blacklist + 清缓存 |
 
-### 已知问题：`session.idle` 的结算参数
+### `session.idle` 只做清理与核对
 
-`index.ts:239`：
+idle 分支曾调用 `settleWriter`，但那是无效的：`settleWriterOnce`（`writer.ts:410`）
+按 `p.childSessionID === childSessionID` 匹配，而 `state` 的键是父会话 id、值里的
+`childSessionID` 是子会话 id，`session.idle` 事件只带父会话 id，永远匹配不上。
+同分支的 `session.status` 兜底同理。
 
-```ts
-await settleWriter(writerDeps, writerState, sid)   // sid 是父会话 id
-```
-
-而 `settleWriterOnce`（`writer.ts:410`）按 `p.childSessionID === childSessionID` 匹配。
-`state` 的键是父会话 id、值里的 `childSessionID` 是子会话 id，二者永不相等。
-
-**这条路径实际是 no-op。** 结算实际由 `watchChildCompletion` 的 5 秒轮询完成。
-同分支的 `expireWriters` 是有效的（它遍历整个 map，不依赖传入的 sid）。
-
-影响：无功能损失（轮询已覆盖），但 idle 与 status 两个分支的 `settleWriter` 调用
-是死代码。
+两处调用已在 0.6.2 删除，结算统一由 `watchChildCompletion` 的轮询负责（见 2.4）。
+`expireWriters` 保留——它遍历整个 map，不依赖传入的 id，是有效的。
 
 ### 启动补偿链
 

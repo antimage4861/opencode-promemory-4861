@@ -234,19 +234,12 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
     },
     event: async ({ event }) => {
       if (event.type === "session.idle") {
-        const sid = (event.properties as any)?.sessionID as string | undefined
-        if (sid) {
-          await settleWriter(writerDeps, writerState, sid)
-          expireWriters(writerDeps, writerState, cfg.writerTimeoutMs)
-        }
+        // Settlement is not driven from here: settleWriter matches pending
+        // writers by child session id, and this event only carries the parent
+        // session id, so the lookup could never match. The child completion is
+        // picked up by the 5s poll in watchChildCompletion instead.
+        expireWriters(writerDeps, writerState, cfg.writerTimeoutMs)
         reportDreamIfDue()
-        return
-      }
-      if (event.type === "session.status") {
-        const props = event.properties as { sessionID?: string; status?: { type?: string } } | undefined
-        if (props?.sessionID && props.status?.type === "idle") {
-          await settleWriter(writerDeps, writerState, props.sessionID)
-        }
         return
       }
       if (event.type === "message.updated") {
