@@ -44,10 +44,93 @@ export const SECTION_CAPS: Record<MemorySection, number> = {
 const DELTA_OPEN = "<!-- project-memory-delta"
 const DELTA_CLOSE = "-->"
 const LAYOUT_KEY_PREFIX = "memory_layout:"
+const GLOBAL_APPENDED_KEY = "global_appended"
 export const LAYOUT_VERSION = "sections-v1"
+
+/**
+ * Cap for the global file. Borrowed from MiMoCode's `caps.global`; global is
+ * meant to hold a handful of durable environment facts, not a second
+ * project memory, so it stays small enough that a misclassification is visible
+ * by looking at the file.
+ */
+export const GLOBAL_CAP = 6000
+
+/**
+ * What the writer is asked to classify each increment into.
+ *
+ * `project` — facts about this repository, keyed by the four sections above.
+ * `global`  — facts about the user and this machine that hold regardless of
+ *              which project is open: platform quirks, missing CLI tools, the
+ *              user's habitual debugging commands. A fact that is only true
+ *              inside the current project belongs in `project`, never here.
+ *
+ * Cross-project standing rules are NOT global memory — they live in the user's
+ * AGENTS.md, which is injected as instructions rather than retrieved as
+ * evidence. Keeping the two apart is what stops this file becoming a second,
+ * less authoritative copy of the instructions.
+ */
+export type WriterDelta = { project: MemoryDelta; global: string }
+
 
 export function emptyDelta(): MemoryDelta {
   return { "Project context": "", Rules: "", "Architecture decisions": "", "Discovered durable knowledge": "" }
+}
+
+const GLOBAL_KEY = "global"
+
+export function globalTemplate(): string {
+  return [
+    "# 全局记忆（跨项目）",
+    "",
+    "> 存放**关于用户与这台机器、换个项目依然成立**的事实：平台怪癖、缺失的工具、习惯用的命令。",
+    "",
+    "> 不放这里：跨项目的硬性规范与偏好（那属于 AGENTS.md）、只在单个项目成立的事实（那属于该项目的 MEMORY.md）。",
+    "",
+  ].join("\n")
+}
+
+export function ensureGlobalTemplate(root: string): boolean {
+  const target = buildPath({ root, scope: "global", key: "MEMORY" })
+  if (readMemoryFile(target) !== null) return false
+  return writeMemoryFile(target, globalTemplate()).ok
+}
+
+export function renderGlobalMemory(body: string): string {
+  const content = body.trim()
+  return `${globalTemplate()}\n## 已沉淀事实\n\n${content || "_（暂无）_"}\n`
+}
+
+/**
+ * Merge into the global file. Idempotent through the same watermark trick as
+ * the project file, so a retried settle cannot double-append. The newest
+ * entries survive truncation, matching the project sections' behaviour.
+ */
+export function mergeGlobalMemory(
+  root: string,
+  delta: string,
+  db?: Db,
+  watermarkMs?: number,
+): { ok: boolean; truncatedLines: number } {
+  const normalized = normalizeBullets(delta)
+  if (!normalized.trim()) return { ok: true, truncatedLines: 0 }
+  if (db && typeof watermarkMs === "number") {
+    const covered = Number(metaGet(db, GLOBAL_APPENDED_KEY) ?? "0")
+    if (Number.isFinite(covered) && watermarkMs <= covered) return { ok: true, truncatedLines: 0 }
+  }
+  const target = buildPath({ root, scope: "global", key: "MEMORY" })
+  const existing = readMemoryFile(target) ?? ""
+  const previous = existing.includes("## 已沉淀事实")
+    ? (existing.split("## 已沉淀事实").slice(1).join("## 已沉淀事实").trim() ?? "")
+    : ""
+  const prior = previous && previous !== "_（暂无）_" ? previous : ""
+  const combined = prior ? `${prior}\n\n${normalized}` : normalized
+  const capped = capSection(combined, GLOBAL_CAP)
+  const written = writeMemoryFile(target, renderGlobalMemory(capped.text))
+  if (!written.ok) return { ok: false, truncatedLines: capped.truncated }
+  if (db && typeof watermarkMs === "number") {
+    metaSet(db, GLOBAL_APPENDED_KEY, String(watermarkMs))
+  }
+  return { ok: true, truncatedLines: capped.truncated }
 }
 
 function heading(line: string): MemorySection | null {
@@ -136,10 +219,11 @@ export function capSection(text: string, cap: number): { text: string; truncated
 
 /**
  * Extract the delta block the writer appended to its reply. Returns null when
- * absent or unparseable so the caller can fall back to the 0.4.x append
- * behaviour rather than losing the result.
+ * neither part carries content, so the caller can fall back to the 0.4.x append
+ * behaviour rather than losing the result. A global-only delta is valid: the
+ * project sections may all be empty.
  */
-export function extractDelta(reply: string): MemoryDelta | null {
+export function extractDelta(reply: string): WriterDelta | null {
   const start = reply.indexOf(DELTA_OPEN)
   if (start < 0) return null
   const from = start + DELTA_OPEN.length
@@ -154,12 +238,16 @@ export function extractDelta(reply: string): MemoryDelta | null {
     return null
   }
   if (typeof parsed !== "object" || parsed === null) return null
-  const out = emptyDelta()
+  const obj = parsed as Record<string, unknown>
+  const project = emptyDelta()
   for (const name of MEMORY_SECTIONS) {
-    const value = (parsed as Record<string, unknown>)[name]
-    if (typeof value === "string" && value.trim()) out[name] = value.trim()
+    const value = obj[name]
+    if (typeof value === "string" && value.trim()) project[name] = value.trim()
   }
-  return MEMORY_SECTIONS.some((n) => out[n]) ? out : null
+  const global = typeof obj[GLOBAL_KEY] === "string" ? obj[GLOBAL_KEY].trim() : ""
+  const hasProject = MEMORY_SECTIONS.some((n) => project[n])
+  if (!hasProject && !global) return null
+  return { project, global }
 }
 
 /** Strip the machine-readable block so it never reaches a memory file. */

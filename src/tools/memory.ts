@@ -5,16 +5,16 @@ import { searchMemory } from "../memory/service.ts"
 export function createMemoryTool(deps: { db: () => Db; reconcile: () => void; scoreFloor: () => number; getProjectId: () => string | null }) {
   return tool({
     description: [
-      "检索项目的策展记忆（checkpoint / 项目 MEMORY.md 的 BM25 搜索）。",
+      "检索策展记忆（checkpoint / 项目 MEMORY.md / 全局 MEMORY.md 的 BM25 搜索）。",
       "何时用：需要回忆早前会话沉淀的结论、决策、精确配置时。",
       "用法：给 1-2 个独特词（函数名/ID/术语）最有效；0 结果不代表没记录过，参考返回中的升级指引，或改用 history 工具回溯原文。",
       "默认检索当前项目的策展记忆（projects/<pid>）。跨项目需显式传 scope/scope_id。",
-      "本工具只读。notes / free / global 三个类型已预留但无写入端，永远不会有内容。",
+      "本工具只读。scope=global 可查跨项目环境与习惯事实；notes / free 已预留但无写入端，永远不会有内容。",
     ].join("\n"),
     args: {
       operation: tool.schema.enum(["search"]).optional().describe("操作，默认 search"),
       query: tool.schema.string().describe("检索词（BM25，OR 连接，1-2 个独特词最佳）"),
-      scope: tool.schema.enum(["global", "projects", "sessions"]).optional().describe("按层级过滤"),
+      scope: tool.schema.enum(["global", "projects", "sessions"]).optional().describe("按层级过滤；global=跨项目环境事实，projects=当前项目(默认)"),
       scope_id: tool.schema.string().optional().describe("按 scope id 过滤（如会话 id、项目 pid）"),
       type: tool.schema.string().optional().describe("按类型过滤（memory/checkpoint 实际有数据；notes/free 预留但无写入端）"),
       limit: tool.schema.number().optional().describe("返回条数，默认 10"),

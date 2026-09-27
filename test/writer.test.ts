@@ -4,7 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { resolveProjectId } from "../src/memory/paths.ts"
 import { projectMemoryTemplate } from "../src/memory/template.ts"
-import { SECTION_CAPS, migrateMemoryLayout, normalizeBullets } from "../src/memory/merge.ts"
+import { GLOBAL_CAP, SECTION_CAPS, mergeGlobalMemory, migrateMemoryLayout, normalizeBullets } from "../src/memory/merge.ts"
 import type { Db } from "../src/memory/db.ts"
 import {
   bumpWriterFail,
@@ -584,3 +584,101 @@ describe("bullet normalization", () => {
     expect(normalizeBullets(list)).toBe(list)
   })
 })
+
+describe("global memory", () => {
+  const globalLine = (obj: Record<string, string>) =>
+    `<!-- project-memory-delta ${JSON.stringify(obj)} -->`
+
+  test("merges an environment fact into global and leaves the project file alone", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const projectDir = path.join(root, "project")
+    const globalPath = path.join(root, "global", "MEMORY.md")
+    const projectPath = path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md")
+    const reply = `${checkpoint}\n\n${globalLine({ global: "- 本机没有 gh CLI，PR 只能网页创建" })}\nCHECKPOINT_DONE`
+    const { deps, logs } = createLoggedDeps(root, db, okMessages(reply))
+    const target = createTarget(projectDir)
+    try {
+      await finalizeWriter(deps, target, "child-global")
+      const global = fs.readFileSync(globalPath, "utf8")
+      expect(global).toContain("## 已沉淀事实")
+      expect(global).toContain("本机没有 gh CLI")
+      // 只有 global 内容时不应重写项目记忆，也不该退回追加路径
+      expect(fs.existsSync(projectPath)).toBe(false)
+      expect(logs.some((l) => l.message.includes("falling back to append"))).toBe(false)
+      expect(logs.filter((l) => l.level === "error")).toHaveLength(0)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("routes project and global facts to their own files in one settle", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const projectDir = path.join(root, "project")
+    const reply = `${checkpoint}\n\n${globalLine({
+      "Architecture decisions": "- 本项目记忆不设体积上限",
+      global: "- PowerShell 处理中文引号会吞引号",
+    })}\nCHECKPOINT_DONE`
+    const { deps } = createLoggedDeps(root, db, okMessages(reply))
+    const target = createTarget(projectDir)
+    try {
+      await finalizeWriter(deps, target, "child-both")
+      const global = fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf8")
+      const project = fs.readFileSync(path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md"), "utf8")
+      expect(global).toContain("PowerShell")
+      expect(global).not.toContain("体积上限")
+      expect(project).toContain("本项目记忆不设体积上限")
+      expect(project).not.toContain("PowerShell")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a replayed watermark does not duplicate", () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const globalPath = path.join(root, "global", "MEMORY.md")
+    const fact = "- 用户在 Windows 上开发，路径分隔符需注意"
+    try {
+      expect(mergeGlobalMemory(root, fact, db, 1000).ok).toBe(true)
+      const first = fs.readFileSync(globalPath, "utf8")
+      // 同一水位重放（失败重试场景）：不得再次追加
+      expect(mergeGlobalMemory(root, fact, db, 1000).ok).toBe(true)
+      expect(fs.readFileSync(globalPath, "utf8")).toBe(first)
+      expect(first.split("用户在 Windows 上开发").length - 1).toBe(1)
+      // 更旧的水位同样跳过
+      expect(mergeGlobalMemory(root, fact, db, 500).ok).toBe(true)
+      expect(fs.readFileSync(globalPath, "utf8")).toBe(first)
+      // 更大的水位是新增量，应当追加
+      expect(mergeGlobalMemory(root, "- 后来的事实", db, 2000).ok).toBe(true)
+      expect(fs.readFileSync(globalPath, "utf8")).toContain("后来的事实")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("truncates global when it outgrows its cap, keeping the newest", () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const fat = "- " + "惯".repeat(400)
+    let reply = `${checkpoint}\n\n${globalLine({ global: `${fat}\n- 最早的条目` })}\nCHECKPOINT_DONE`
+    const { deps, logs } = createLoggedDeps(root, db, async () => ({
+      data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: reply }] }],
+    }))
+    try {
+      return (async () => {
+        for (let i = 0; i < 6; i++) {
+          reply = `${checkpoint}\n\n${globalLine({ global: `${fat}\n- 第${i}轮新增` })}\nCHECKPOINT_DONE`
+          await finalizeWriter(deps, { sessionID: `g-${i}`, projectDir: root, title: "t" }, `gc-${i}`)
+        }
+        const global = fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf8")
+        expect(Buffer.byteLength(global, "utf8")).toBeLessThanOrEqual(GLOBAL_CAP + 400)
+        expect(logs.some((l) => l.message.includes("global memory truncated"))).toBe(true)
+      })()
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
