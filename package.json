@@ -35,13 +35,14 @@
     "bun": ">=1.0.0"
   },
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "build": "npm run gen:prompt && node scripts/build.mjs",
     "test": "bun test",
-    "check": "node scripts/publish-check.mjs",
+    "check": "npm run gen:prompt -- --check && node scripts/publish-check.mjs",
     "pack": "npm run build && npm pack",
     "install:commands": "node scripts/install.mjs",
     "sync:deploy": "node scripts/sync-deploy.mjs",
-    "release": "node scripts/github-release.mjs"
+    "release": "node scripts/github-release.mjs",
+    "gen:prompt": "node scripts/gen-prompt.mjs"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.9",
