@@ -663,7 +663,7 @@ describe("global memory", () => {
     }
   })
 
-  test("truncates global when it outgrows its cap, keeping the newest", () => {
+  test("truncates global when it outgrows its cap, keeping the newest", async () => {
     const root = tempRoot()
     const { db } = createDb()
     const fat = "- " + "惯".repeat(400)
@@ -672,15 +672,13 @@ describe("global memory", () => {
       data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: reply }] }],
     }))
     try {
-      return (async () => {
-        for (let i = 0; i < 6; i++) {
-          reply = `${checkpoint}\n\n${globalLine({ "Global (cross-project facts)": `${fat}\n- 第${i}轮新增` })}\nCHECKPOINT_DONE`
-          await finalizeWriter(deps, { sessionID: `g-${i}`, projectDir: root, title: "t" }, `gc-${i}`)
-        }
-        const global = fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf8")
-        expect(Buffer.byteLength(global, "utf8")).toBeLessThanOrEqual(GLOBAL_CAP + 400)
-        expect(logs.some((l) => l.message.includes("global memory truncated"))).toBe(true)
-      })()
+      for (let i = 0; i < 6; i++) {
+        reply = `${checkpoint}\n\n${globalLine({ "Global (cross-project facts)": `${fat}\n- 第${i}轮新增` })}\nCHECKPOINT_DONE`
+        await finalizeWriter(deps, { sessionID: `g-${i}`, projectDir: root, title: "t" }, `gc-${i}`)
+      }
+      const global = fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf8")
+      expect(Buffer.byteLength(global, "utf8")).toBeLessThanOrEqual(GLOBAL_CAP + 400)
+      expect(logs.some((l) => l.message.includes("global memory truncated"))).toBe(true)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
@@ -758,49 +756,67 @@ describe("dream verification", () => {
     const root = tempRoot()
     const projectDir = path.join(root, "project")
     const p = memoryOf(root, projectDir)
-    fs.mkdirSync(path.dirname(p), { recursive: true })
-    fs.writeFileSync(p, ["## Rules", "- 旧事实：格式是 JSON", "- 保留事实", ""].join("\n"), "utf8")
-    const snap = snapshotProjectMemory(root, projectDir)
-    expect(snap).not.toBeNull()
-    // dream 修订：删掉过时那条，改写另一条，再加一条新的
-    fs.writeFileSync(p, ["## Rules", "- 保留事实", "- 新事实：格式是 markdown", ""].join("\n"), "utf8")
-    const diff = diffProjectMemory(snap, root)!
-    expect(diff.changed).toBe(true)
-    expect(diff.removed).toBe(1)
-    expect(diff.added).toBe(1)
-    expect(diff.linesBefore).toBe(3)
-    expect(diff.linesAfter).toBe(3)
-    expect(describeDreamDiff(diff)).toContain("删 1 行 / 增 1 行")
+    try {
+      fs.mkdirSync(path.dirname(p), { recursive: true })
+      fs.writeFileSync(p, ["## Rules", "- 旧事实：格式是 JSON", "- 保留事实", ""].join("\n"), "utf8")
+      const snap = snapshotProjectMemory(root, projectDir)
+      expect(snap).not.toBeNull()
+      // dream 修订：删掉过时那条，改写另一条，再加一条新的
+      fs.writeFileSync(p, ["## Rules", "- 保留事实", "- 新事实：格式是 markdown", ""].join("\n"), "utf8")
+      const diff = diffProjectMemory(snap, root)!
+      expect(diff.changed).toBe(true)
+      expect(diff.removed).toBe(1)
+      expect(diff.added).toBe(1)
+      expect(diff.linesBefore).toBe(3)
+      expect(diff.linesAfter).toBe(3)
+      expect(describeDreamDiff(diff)).toContain("删 1 行 / 增 1 行")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test("flags an append-only run, which is not a revision", () => {
     const root = tempRoot()
     const projectDir = path.join(root, "project")
     const p = memoryOf(root, projectDir)
-    fs.mkdirSync(path.dirname(p), { recursive: true })
-    fs.writeFileSync(p, "## Rules\n- 既有事实\n", "utf8")
-    const snap = snapshotProjectMemory(root, projectDir)
-    fs.writeFileSync(p, "## Rules\n- 既有事实\n- 只有新增\n", "utf8")
-    const text = describeDreamDiff(diffProjectMemory(snap, root)!)
-    expect(text).toContain("只有新增没有删除")
+    try {
+      fs.mkdirSync(path.dirname(p), { recursive: true })
+      fs.writeFileSync(p, "## Rules\n- 既有事实\n", "utf8")
+      const snap = snapshotProjectMemory(root, projectDir)
+      fs.writeFileSync(p, "## Rules\n- 既有事实\n- 只有新增\n", "utf8")
+      const text = describeDreamDiff(diffProjectMemory(snap, root)!)
+      expect(text).toContain("只有新增没有删除")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test("flags a no-op run instead of reporting success", () => {
     const root = tempRoot()
     const projectDir = path.join(root, "project")
     const p = memoryOf(root, projectDir)
-    fs.mkdirSync(path.dirname(p), { recursive: true })
-    fs.writeFileSync(p, "## Rules\n- 既有事实\n", "utf8")
-    const snap = snapshotProjectMemory(root, projectDir)
-    const text = describeDreamDiff(diffProjectMemory(snap, root)!)
-    expect(text).toContain("未改动项目记忆")
-    expect(text).toContain("说明它没有生效")
+    try {
+      fs.mkdirSync(path.dirname(p), { recursive: true })
+      fs.writeFileSync(p, "## Rules\n- 既有事实\n", "utf8")
+      const snap = snapshotProjectMemory(root, projectDir)
+      const text = describeDreamDiff(diffProjectMemory(snap, root)!)
+      expect(text).toContain("未改动项目记忆")
+      expect(text).toContain("说明它没有生效")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test("returns null when there is no project memory to snapshot", () => {
     const root = tempRoot()
-    expect(snapshotProjectMemory(root, path.join(root, "nope"))).toBeNull()
-    expect(snapshotProjectMemory(root, undefined)).toBeNull()
-    expect(diffProjectMemory(null, tempRoot())).toBeNull()
+    const other = tempRoot()
+    try {
+      expect(snapshotProjectMemory(root, path.join(root, "nope"))).toBeNull()
+      expect(snapshotProjectMemory(root, undefined)).toBeNull()
+      expect(diffProjectMemory(null, other)).toBeNull()
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+      fs.rmSync(other, { recursive: true, force: true })
+    }
   })
 })
