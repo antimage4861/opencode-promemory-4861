@@ -1,3 +1,23 @@
+# 0.6.1 (2026-09-28)
+
+- **修复:delta 块从 JSON 改为 markdown 分节格式**。0.6.0 的 global 写入路径首次生产验证即失败:子代理输出的 JSON 里有 10 处非法转义,全部是 Windows 路径的单反斜杠 —— `D:\RMANBAK` 里的 `\R` 不是合法 JSON 转义,整个块解析失败,宿主退回追加路径,项目 MEMORY.md 混进一整份原始 checkpoint(已清理),global 一条没写。
+  - 根因不是模型偶发失误,而是格式选错:路径是本系统最高频的内容,而 Windows 路径放进 JSON 字符串要求每个反斜杠都转义成双写。子代理在同一块内有的地方转义了、有的没转,必然翻车。
+  - 改为 markdown 分节(`## Project context` / `## Rules` / `## Architecture decisions` / `## Discovered durable knowledge` / `## Global (cross-project facts)`),对内容零约束:反斜杠、直引号、箭头、空行全部原样保留。解析复用记忆文件本身已在用的分节思路,单趟扫描 O(n)。
+  - 提示词明确写了「this is markdown, not JSON」并给出 Windows 路径的正例。
+  - 块边界不再用 `indexOf("-->")`:内容里的箭头(如「迁移 --> 展开」)会截断块,改为只认整行等于 `-->`;模型把标记接在最后一行时仍兼容。
+  - 退回路径的告警措辞随之改为「delta block present but no recognised section heading」—— markdown 格式下已不存在「解析失败」这回事。
+  - npm test 增至 31 个用例,新增覆盖:反斜杠路径/引号/箭头/缩进续行原样解析、真实失败的那类内容可解析、不认识的标题被忽略而非整体失败、无有效内容时返回 null。
+- **新增:dream 具备修订能力并留下核对日志**。writer 只追加,过时事实只能靠 dream 修订 —— 这是它区别于 writer 的唯一职责,但此前做不到:
+  - 模板只让 dream 读 checkpoints,没说先读 `projects/<pid>/MEMORY.md`。而它要做的恰恰是重写:没读过目标文件就去重,等于闭着眼睛覆盖,甚至可能拿 checkpoint 重写整个文件,把之前 dream 自己整合的结论冲掉。模板改为三段式(先读目标文件 → 整合与修订 → 注意),明确「被新事实推翻的旧条目要删除或改写,不允许新旧并存」。
+  - dream 是 agent 自主行为,插件只管间隔拦截,它到底改了什么事后无从验证 —— 静默的空转和成功的收敛看起来一模一样。闸门放行时快照项目记忆全文,下一个 `session.idle`(agent 那一轮结束)比对并记日志:保留快照原文而非只存哈希,才能报出「删了几行/增了几行」;三种结果分别措辞 —— 有删有增(正常修订)、只增未删(是追加不是修订)、完全未改(整合没生效)。
+  - 频率仍为 7 天手动,未改。首跑实测:14274→15367 字节,删 43 行 / 增 29 行。
+- **修复:命令模板安装到全部位置并按内容比对**。`install.mjs` 只挑第一个存在的候选目录,且用 mtime 判新旧,两个后果都实测到:
+  - 项目级 `.opencode/command` 根本不在候选里 —— 而 TUI 的工作目录就是仓库父目录,读的是那份。本次把 mem-dream 改成三段式后全局那份更新了、项目级那份仍停在 09-24,只有手工 cp 才生效。
+  - mtime 不是可靠的新旧信号:文件只是被复制来复制去,时间戳的先后与内容是否一致无关。
+  - 改为:候选含 `OPENCODE_CONFIG_DIR/command`、`~/.config/opencode/command` 及从 cwd 向上找到的所有 `.opencode/command`,全部安装;按内容比对;装完交叉校验每个位置的字节一致,不一致则退出码非 0。验证:人为把项目级那份改成过期内容,脚本自动发现并修复。
+- **修复:`gen-deploy-entry` 的安全网文案区分两种成因**(模块未列入 `SHARED_REL` / 已列入但忘了先跑 `sync:deploy`)。新增 `session/dream.ts` 时立刻被它拦下,但原文案把第二种也说成「需加入清单」,会把人引向错误的修复方向。
+- `sync:deploy` 清单补入 `session/dream.ts`。
+
 # 0.6.0 (2026-09-27)
 
 - **新增:`global/MEMORY.md` 跨项目环境与习惯事实**。此前 global 只在类型与检索层预留、没有任何写入方,永远是空的。
@@ -11,14 +31,6 @@
   - **上游 MiMoCode 的 global 是「read-only from the agent side, no auto-create」** —— 完全没有写入方,其价值靠注入实现。本插件不做注入,因此 global 只能被主动检索;这削弱了它的自动生效程度,是与上游的设计差异。
 - README 与 memory 工具描述同步:global 从「预留无写入端」改为「由 writer 维护」;`notes` / `free` 仍无写入端。
 - npm test 增至 27 个用例,新增覆盖:仅 global 内容的结算不碰项目文件、一次结算内项目与 global 各归各位、同一水位重放不重复、global 超预算裁剪保留最新。
-
-- **修复:delta 块从 JSON 改为 markdown 分节格式**。首次生产验证即失败:子代理输出的 JSON 里有 10 处非法转义,全部是 Windows 路径的单反斜杠(`D:\RMANBAK` 里的 `\R` 不是合法 JSON 转义),整个块解析失败。
-  - 根因不是模型偶发失误,而是格式选错:路径是本系统最高频的内容,而 Windows 路径放进 JSON 字符串要求每个反斜杠都转义成双写。子代理在同一块内有的地方转义了、有的没转,必然翻车。
-  - 改为 markdown 分节(`## Project context` / `## Rules` / `## Architecture decisions` / `## Discovered durable knowledge` / `## Global (cross-project facts)`),对内容零约束:反斜杠、直引号、箭头、空行全部原样保留。解析复用记忆文件本身已在用的分节逻辑。
-  - 提示词明确写了「this is markdown, not JSON」并给出 Windows 路径的正例。
-  - 块边界不再用 `indexOf("-->")`:内容里的箭头(如「迁移 --> 展开」)会截断块,改为只认整行等于 `-->`;模型把标记接在最后一行时仍兼容。
-  - 退回路径的告警措辞随之改为「delta block present but no recognised section heading」。
-  - npm test 增至 31 个用例,新增覆盖:反斜杠路径/引号/箭头/缩进续行原样解析、今天真实失败的那类内容可解析、不认识的标题被忽略而非整体失败、无有效内容时返回 null。
 
 # 0.5.0 (2026-09-27)
 
