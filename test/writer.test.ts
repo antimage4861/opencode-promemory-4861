@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { resolveProjectId } from "../src/memory/paths.ts"
 import { projectMemoryTemplate } from "../src/memory/template.ts"
+import { SECTION_CAPS, migrateMemoryLayout } from "../src/memory/merge.ts"
 import type { Db } from "../src/memory/db.ts"
 import {
   bumpWriterFail,
@@ -399,6 +400,167 @@ describe("writer retry cap", () => {
       await finalizeWriter(deps, target, "child-empty")
       expect(writerFailCount(db, target.sessionID)).toBe(1)
       expect(logs.some((l) => l.message.includes("produced no output"))).toBe(true)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("sectioned project memory", () => {
+  const deltaLine = (obj: Record<string, string>) =>
+    `<!-- project-memory-delta ${JSON.stringify(obj)} -->`
+
+  const fourKeys = {
+    "Project context": "- 这是一个开源插件",
+    Rules: "- 禁止直推 main",
+    "Architecture decisions": "- 记忆用两库而非单库",
+    "Discovered durable knowledge": "- Path.contains 在 .NET 上语义不同",
+  }
+
+  test("merges a delta into the four sections and keeps the file bounded", async () => {
+    const root = tempRoot()
+    const { db, values } = createDb()
+    const projectDir = path.join(root, "project")
+    const memoryPath = path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md")
+    const reply = `${checkpoint}\n\n${deltaLine(fourKeys)}\nCHECKPOINT_DONE`
+    const { deps, logs } = createLoggedDeps(root, db, okMessages(reply))
+    const target = createTarget(projectDir)
+    try {
+      await finalizeWriter(deps, target, "child-merge")
+      const merged = fs.readFileSync(memoryPath, "utf8")
+      for (const [k, v] of Object.entries(fourKeys)) expect(merged).toContain(`## ${k}`)
+      expect(merged).toContain("- 禁止直推 main")
+      // checkpoint 自身不应进项目记忆，delta 块也不该出现
+      expect(merged).not.toContain("并发 settle 回归测试")
+      expect(merged).not.toContain("project-memory-delta")
+      // checkpoint 文件里同样不能有 delta 块
+      const cp = fs.readFileSync(checkpointPath(root, target.sessionID), "utf8")
+      expect(cp).not.toContain("project-memory-delta")
+      expect(cp).toContain("## Summary")
+      expect(values.has(`memory_layout:${resolveProjectId(projectDir)}`)).toBe(true)
+      expect(logs.some((l) => l.message.includes("falling back to append"))).toBe(false)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("accumulates a second delta into the same sections without appending raw", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const projectDir = path.join(root, "project")
+    const memoryPath = path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md")
+    let { deps } = createLoggedDeps(root, db, okMessages(`${checkpoint}\n\n${deltaLine(fourKeys)}\nCHECKPOINT_DONE`))
+    const target = createTarget(projectDir)
+    try {
+      await finalizeWriter(deps, target, "child-1")
+      const first = fs.readFileSync(memoryPath, "utf8")
+      const second = `${checkpoint}\n\n${deltaLine({ ...fourKeys, Rules: "- 提交前必须跑测试" })}\nCHECKPOINT_DONE`
+      ;({ deps } = createLoggedDeps(root, db, okMessages(second)))
+      await finalizeWriter(deps, target, "child-2")
+      const merged = fs.readFileSync(memoryPath, "utf8")
+      expect(merged).toContain("- 禁止直推 main")
+      expect(merged).toContain("- 提交前必须跑测试")
+      expect(merged.length).toBeLessThan(first.length * 2)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("falls back to append when the delta block is malformed", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const projectDir = path.join(root, "project")
+    const memoryPath = path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md")
+    const reply = `${checkpoint}\n\n<!-- project-memory-delta {不是合法 JSON} -->\nCHECKPOINT_DONE`
+    const { deps, logs } = createLoggedDeps(root, db, okMessages(reply))
+    const target = createTarget(projectDir)
+    try {
+      await finalizeWriter(deps, target, "child-bad")
+      const merged = fs.readFileSync(memoryPath, "utf8")
+      expect(merged).toContain("并发 settle 回归测试")
+      expect(logs.some((l) => l.message.includes("unparseable, appending instead"))).toBe(true)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("truncates the oldest lines when a section outgrows its budget", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const projectDir = path.join(root, "project")
+    const memoryPath = path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md")
+    const fat = "- " + "内".repeat(400)
+    const big: Record<string, string> = {}
+    for (let i = 0; i < 12; i++) big["Discovered durable knowledge"] = `${big["Discovered durable knowledge"] ?? ""}\n- 第${i}条 ${fat}`
+    let reply = `${checkpoint}\n\n${deltaLine(big)}\nCHECKPOINT_DONE`
+    const { deps, logs } = createLoggedDeps(root, db, async () => ({
+      data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: reply }] }],
+    }))
+    const target = createTarget(projectDir)
+    try {
+      for (let i = 0; i < 8; i++) {
+        reply = `${checkpoint}\n\n${deltaLine({ ...big, "Discovered durable knowledge": `${big["Discovered durable knowledge"]}\n- 第${i}轮新增` })}\nCHECKPOINT_DONE`
+        await finalizeWriter(deps, { ...target, sessionID: `sess-${i}` }, `child-${i}`)
+      }
+      const merged = fs.readFileSync(memoryPath, "utf8")
+      const section = merged.split("## Discovered durable knowledge")[1] ?? ""
+      expect(Buffer.byteLength(section, "utf8")).toBeLessThanOrEqual(SECTION_CAPS["Discovered durable knowledge"] + 300)
+      // 最新的内容必须留下，砍掉的应该是头部
+      expect(section).toContain("第7轮新增")
+      expect(logs.some((l) => l.message.includes("project memory truncated"))).toBe(true)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("layout migration", () => {
+  test("folds a legacy MEMORY.md into the four sections, once", () => {
+    const root = tempRoot()
+    const { db, values } = createDb()
+    const projectDir = path.join(root, "project")
+    const pid = resolveProjectId(projectDir)
+    const memoryPath = path.join(root, "projects", pid, "MEMORY.md")
+    fs.mkdirSync(path.join(root, "projects", pid), { recursive: true })
+    fs.writeFileSync(memoryPath, "# 项目记忆\n\n## 旧的自定义小节\n- 旧内容 A\n- 旧内容 B\n", "utf8")
+    const classified = {
+      "Project context": "- 旧内容 A",
+      Rules: "",
+      "Architecture decisions": "- 旧内容 B",
+      "Discovered durable knowledge": "",
+    }
+    try {
+      const first = migrateMemoryLayout(db, root, projectDir, pid, classified)
+      expect(first).toEqual({ migrated: true, reason: "migrated" })
+      const merged = fs.readFileSync(memoryPath, "utf8")
+      expect(merged).toContain("## Project context")
+      expect(merged).toContain("## Discovered durable knowledge")
+      expect(merged).not.toContain("## 旧的自定义小节")
+      expect(merged).toContain("- 旧内容 A")
+      // 幂等：第二次直接跳过
+      const second = migrateMemoryLayout(db, root, projectDir, pid, null)
+      expect(second).toEqual({ migrated: false, reason: "already-migrated" })
+      expect(fs.readFileSync(memoryPath, "utf8")).toBe(merged)
+      expect(values.get(`memory_layout:${pid}`)).toBeTruthy()
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("refuses to guess when no classification is supplied", () => {
+    const root = tempRoot()
+    const { db, values } = createDb()
+    const projectDir = path.join(root, "project")
+    const pid = resolveProjectId(projectDir)
+    fs.mkdirSync(path.join(root, "projects", pid), { recursive: true })
+    fs.writeFileSync(path.join(root, "projects", pid, "MEMORY.md"), "旧的自由格式内容", "utf8")
+    try {
+      expect(migrateMemoryLayout(db, root, projectDir, pid, null)).toEqual({
+        migrated: false,
+        reason: "needs-classification",
+      })
+      expect(fs.readFileSync(path.join(root, "projects", pid, "MEMORY.md"), "utf8")).toBe("旧的自由格式内容")
+      expect(values.has(`memory_layout:${pid}`)).toBe(false)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
