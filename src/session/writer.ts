@@ -357,13 +357,13 @@ async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childS
           }
         }
       } else if (result.includes("<!-- project-memory-delta")) {
-        // The block was emitted but unparseable. Logged because otherwise the
-        // sectioned layout silently degrades to append mode for the rest of
-        // time and nothing points at the prompt instruction being violated.
+        // The block was emitted but carried no recognised section heading. Logged
+        // because otherwise the sectioned layout silently degrades to append mode
+        // for the rest of time and nothing points at the prompt being violated.
         reportFailure(
           deps,
           "warn",
-          `project memory delta block present but unparseable, appending instead session=${target.sessionID}`,
+          `delta block present but no recognised section heading, appending instead session=${target.sessionID}`,
         )
       }
       if (!usedMerge) {

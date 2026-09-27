@@ -47,6 +47,9 @@ const LAYOUT_KEY_PREFIX = "memory_layout:"
 const GLOBAL_APPENDED_KEY = "global_appended"
 export const LAYOUT_VERSION = "sections-v1"
 
+/** Heading the writer uses for cross-project facts inside the delta block. */
+const GLOBAL_HEADING = "Global (cross-project facts)"
+
 /**
  * Cap for the global file. Borrowed from MiMoCode's `caps.global`; global is
  * meant to hold a handful of durable environment facts, not a second
@@ -76,7 +79,6 @@ export function emptyDelta(): MemoryDelta {
   return { "Project context": "", Rules: "", "Architecture decisions": "", "Discovered durable knowledge": "" }
 }
 
-const GLOBAL_KEY = "global"
 
 export function globalTemplate(): string {
   return [
@@ -218,45 +220,92 @@ export function capSection(text: string, cap: number): { text: string; truncated
 }
 
 /**
- * Extract the delta block the writer appended to its reply. Returns null when
- * neither part carries content, so the caller can fall back to the 0.4.x append
- * behaviour rather than losing the result. A global-only delta is valid: the
- * project sections may all be empty.
+ * Locate the end of the delta block.
+ *
+ * A bare `indexOf("-->")` is not safe: content bullets legitimately contain
+ * arrows (`- 迁移 --> 展开`), and the first one would truncate the block. Only a
+ * line that is exactly the closing marker counts, which no bullet ever is. The
+ * fallback keeps a model that appends the marker to its last line working.
+ */
+function findDeltaEnd(body: string): { end: number; rest: string } {
+  const lines = body.split("\n")
+  let offset = 0
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trim() === DELTA_CLOSE) {
+      return { end: offset, rest: lines.slice(i + 1).join("\n") }
+    }
+    offset += line.length + 1
+  }
+  const at = body.indexOf(DELTA_CLOSE)
+  if (at < 0) return { end: -1, rest: "" }
+  return { end: at, rest: body.slice(at + DELTA_CLOSE.length) }
+}
+
+/**
+ * Strip the machine-readable block so it never reaches a memory file.
+ */
+export function stripDelta(reply: string): string {
+  const start = reply.indexOf(DELTA_OPEN)
+  if (start < 0) return reply
+  const body = reply.slice(start + DELTA_OPEN.length)
+  const { end, rest } = findDeltaEnd(body)
+  if (end < 0) return reply.slice(0, start)
+  return `${reply.slice(0, start)}${rest}`
+}
+
+/**
+ * Extract the delta block the writer appended to its reply.
+ *
+ * Format is markdown sections, not JSON. JSON was tried first and is the wrong
+ * choice here: paths are the highest-frequency content in this system, and a
+ * Windows path in a JSON string needs every backslash doubled. The writer got
+ * that right in some places and wrong in others within the same block, which
+ * fails the whole parse — an intermittent failure that only reproduced on a
+ * real checkpoint. Markdown sections put no constraint on content: backslashes,
+ * quotes, arrows and blank lines all pass through untouched.
+ *
+ * Returns null when neither part carries content, so the caller can fall back to
+ * the 0.4.x append behaviour rather than losing the result. A global-only delta
+ * is valid: the project sections may all be absent.
  */
 export function extractDelta(reply: string): WriterDelta | null {
   const start = reply.indexOf(DELTA_OPEN)
   if (start < 0) return null
-  const from = start + DELTA_OPEN.length
-  const end = reply.indexOf(DELTA_CLOSE, from)
+  const body = reply.slice(start + DELTA_OPEN.length)
+  const { end } = findDeltaEnd(body)
   if (end < 0) return null
-  const raw = reply.slice(from, end).trim()
-  if (!raw) return null
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return null
-  }
-  if (typeof parsed !== "object" || parsed === null) return null
-  const obj = parsed as Record<string, unknown>
+  const block = body.slice(0, end)
+
   const project = emptyDelta()
-  for (const name of MEMORY_SECTIONS) {
-    const value = obj[name]
-    if (typeof value === "string" && value.trim()) project[name] = value.trim()
+  let global = ""
+  let bucket: MemorySection | "global" | null = null
+  let buf: string[] = []
+  const flush = () => {
+    const text = buf.join("\n").trim()
+    if (text && bucket === "global") global = text
+    else if (text && bucket) project[bucket] = text
+    buf = []
   }
-  const global = typeof obj[GLOBAL_KEY] === "string" ? obj[GLOBAL_KEY].trim() : ""
+  for (const line of block.split("\n")) {
+    const h = /^##\s+(.+?)\s*$/.exec(line)
+    if (h) {
+      flush()
+      const name = h[1]
+      bucket =
+        name === GLOBAL_HEADING
+          ? "global"
+          : (MEMORY_SECTIONS as readonly string[]).includes(name)
+            ? (name as MemorySection)
+            : null
+      continue
+    }
+    if (bucket) buf.push(line)
+  }
+  flush()
   const hasProject = MEMORY_SECTIONS.some((n) => project[n])
   if (!hasProject && !global) return null
   return { project, global }
-}
-
-/** Strip the machine-readable block so it never reaches a memory file. */
-export function stripDelta(reply: string): string {
-  const start = reply.indexOf(DELTA_OPEN)
-  if (start < 0) return reply
-  const from = start + DELTA_OPEN.length
-  const end = reply.indexOf(DELTA_CLOSE, from)
-  return end < 0 ? reply.slice(0, start) : `${reply.slice(0, start)}${reply.slice(end + DELTA_CLOSE.length)}`
 }
 
 export function layoutDone(db: Db, pid: string): boolean {
