@@ -65,7 +65,7 @@ mem-checkpoint.md  mem-dream.md  mem-distill.md  mem-search.md
 
 | 方式 | 说明 |
 | --- | --- |
-| `memory` 工具 | 检索策展记忆(checkpoint / notes / 项目 MEMORY.md),BM25 排序,命中即权威 |
+| `memory` 工具 | 检索策展记忆(checkpoint / 项目 MEMORY.md),BM25 排序,命中即权威 |
 | `history` 工具 | 检索会话原始对话镜像,`get` 可读某 part 的逐字原文(用于精确值回溯) |
 | `/mem-checkpoint` | 手动把当前会话增量蒸馏为 checkpoint,写入 `sessions/<id>/checkpoint.md` 并追加项目记忆 |
 | `/mem-dream` | 跨会话整合:把多个会话的稳定结论并入项目 `projects/<pid>/MEMORY.md`。默认 7 天一次,未到期拦截跳过 |
@@ -100,11 +100,11 @@ memory/
 ├── memory.db      # 策展记忆 FTS5 索引 + memory_meta
 ├── history.db     # 会话原文镜像 FTS5 索引
 ├── .writers.json  # 子会话蒸馏的在途状态(崩溃恢复用)
-├── global/MEMORY.md
 ├── projects/<pid>/MEMORY.md       # 项目记忆(pid = sha256(projectDir))
-├── sessions/<sessionID>/checkpoint.md
-└── notes/  docs/  free/           # 其他类型记忆
+└── sessions/<sessionID>/checkpoint.md
 ```
+
+`global/MEMORY.md` 与 `notes/ docs/ free/` 已在类型与检索层预留(可按 scope/type 过滤),但**没有任何写入端**,不会自动创建也不会有内容。`memory` 工具是纯只读(仅 `search`),不产出新记忆。
 
 > 删除数据目录即完全重置插件状态。
 

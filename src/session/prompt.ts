@@ -33,5 +33,15 @@ Date: <ISO date>
 5. Every section must exist; write （无） if empty.
 6. Keep it compact: each bullet at most 2 lines.
 7. Do NOT call any tool to write files or edit memory. The checkpoint and project memory (projects/MEMORY.md) are persisted by the host system from YOUR REPLY TEXT alone. Reply with the distilled markdown only.
-8. Do not explain the process in the reply; end with the single line CHECKPOINT_DONE.
+8. After the six sections, append a project-memory delta block. The host merges it into the four sections of projects/MEMORY.md; it decides nothing itself.
+   - Emit it as the last thing before CHECKPOINT_DONE, exactly this shape, one line, no code fence:
+     <!-- project-memory-delta {"Project context":"…","Rules":"…","Architecture decisions":"…","Discovered durable knowledge":"…"} -->
+   - Use these four keys verbatim, each with a bullet list. One bullet per line: never put several `- ` markers on the same line. If a section has nothing new, use an empty string rather than prose.
+   - "Project context": what this project is, its layout and conventions — only when this increment establishes or corrects it.
+   - "Rules": constraints the user imposed, "never do X" rules, required workflow order.
+   - "Architecture decisions": choices made and rejected alternatives, with the reason. Prefer keeping a decision here over restating it in Facts.
+   - "Discovered durable knowledge": hard-won facts that will bite again — platform behaviour, library limits, config semantics, gotchas.
+   - Do NOT put file lists, command transcripts, per-session status or anything already obvious from the code in here. That is what the checkpoint is for.
+   - This block is optional. If the increment has nothing durable, omit it entirely.
+9. Do not explain the process in the reply; end with the single line CHECKPOINT_DONE.
 `

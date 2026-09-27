@@ -2,6 +2,20 @@ import fs from "fs"
 import path from "path"
 import { buildPath, resolveProjectId } from "../memory/paths.ts"
 import { writeMemoryFile, readMemoryFile, withFileLock } from "../memory/storage.ts"
+import { ensureMemoryTemplate } from "../memory/template.ts"
+import {
+  MEMORY_SECTIONS,
+  SECTION_CAPS,
+  capSection,
+  emptyDelta,
+  normalizeBullets,
+  extractDelta,
+  markLayout,
+  parseMemorySections,
+  renderMemorySections,
+  stripDelta,
+  type MemoryDelta,
+} from "../memory/merge.ts"
 import { validateCheckpoint } from "./validator.ts"
 import type { Db } from "../memory/db.ts"
 import { metaGet, metaSet } from "../memory/fts.ts"
@@ -9,6 +23,8 @@ import { metaGet, metaSet } from "../memory/fts.ts"
 const INCREMENT_BUDGET = 24_000
 const WRITER_SYSTEM_BUDGET = 6_000
 const CP_KEY_PREFIX = "scanner:"
+const FAIL_KEY_PREFIX = "writer_fail:"
+const APPEND_KEY_PREFIX = "project_appended:"
 
 interface OrphanRecord {
   childSessionID: string
@@ -33,6 +49,7 @@ export interface WriterDeps {
   settling: Map<string, Promise<boolean>>
   finalizing: Map<string, Promise<boolean>>
   projectDir?: string
+  maxWriterRetries: number
 }
 
 export interface PendingWriter {
@@ -48,8 +65,48 @@ export function lastCheckpointMs(db: Db, sessionID: string): number {
   return Number.isFinite(n) ? n : 0
 }
 
-export function markCheckpoint(db: Db, sessionID: string, ms = Date.now()) {
-  metaSet(db, `${CP_KEY_PREFIX}${sessionID}`, String(ms))
+/**
+ * Failure reporting for the writer pipeline. Every write/validate failure used
+ * to be silent: the caller discarded return values, so a rejected or
+ * unwritable checkpoint simply vanished. Logging goes through the opencode app
+ * log API (falls back to nothing if the SDK shape differs) — a logger must
+ * never itself break the write path.
+ */
+function reportFailure(deps: WriterDeps, level: "warn" | "error", message: string): void {
+  try {
+    void deps.client?.app?.log?.({ body: { service: "project-memory", level, message } })
+  } catch {
+    void 0
+  }
+}
+
+/**
+ * Advance the watermark, never backwards. Two writer children for the same
+ * session can settle out of order (different compaction / manual triggers);
+ * an unconditional Date.now() meant the later-to-settle one pushed the mark
+ * past a window the other had not recorded yet, skipping it for good.
+ */
+export function markCheckpoint(db: Db, sessionID: string, ms = Date.now()): boolean {
+  const key = `${CP_KEY_PREFIX}${sessionID}`
+  if (lastCheckpointMs(db, sessionID) >= ms) return false
+  metaSet(db, key, String(ms))
+  return true
+}
+
+export function writerFailCount(db: Db, sessionID: string): number {
+  const raw = metaGet(db, `${FAIL_KEY_PREFIX}${sessionID}`)
+  const n = raw ? Number(raw) : NaN
+  return Number.isFinite(n) ? n : 0
+}
+
+export function bumpWriterFail(db: Db, sessionID: string): number {
+  const next = writerFailCount(db, sessionID) + 1
+  metaSet(db, `${FAIL_KEY_PREFIX}${sessionID}`, String(next))
+  return next
+}
+
+export function clearWriterFail(db: Db, sessionID: string): void {
+  metaSet(db, `${FAIL_KEY_PREFIX}${sessionID}`, "0")
 }
 
 async function readIncrement(deps: WriterDeps, target: WriterTarget): Promise<{
@@ -149,10 +206,28 @@ async function watchChildCompletion(deps: WriterDeps, state: Map<string, Pending
 
 export function runWriter(task: WriterTarget, deps: WriterDeps, state: Map<string, PendingWriter>): void {
   if (state.has(task.sessionID)) return
+  // Retry cap. Without it a permanently broken target (disk full, read-only
+  // mount) re-distilled on every single trigger, burning a subagent each time
+  // to produce output that can never land. Checked before spawning, not after
+  // failing, so the token cost is what we avoid.
+  const failures = writerFailCount(deps.db, task.sessionID)
+  // `?? 3` guards the hand-maintained deploy entry: it is a copy of this wiring
+  // and has silently drifted once already, where an undefined limit made
+  // `failures >= undefined` false forever and disabled the cap with no error.
+  const limit = deps.maxWriterRetries ?? 3
+  if (failures >= limit) {
+    reportFailure(
+      deps,
+      "error",
+      `writer suppressed session=${task.sessionID} consecutive_failures=${failures} limit=${limit}`,
+    )
+    return
+  }
   void spawnWriter(deps, task, state)
 }
 
 async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childSessionID: string): Promise<boolean> {
+  const settleStart = Date.now()
   try {
     const res = await deps.client.session.messages({ path: { id: childSessionID } })
     const messages = (res?.data ?? []) as Array<{
@@ -168,15 +243,120 @@ async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childS
     }
     const result = assistantTexts.join("\n").trim()
     if (!result) {
+      // Counts as a failure: a child that produced nothing is a failed
+      // distillation, and without this the retry cap never engages — the next
+      // trigger would spawn another subagent to produce nothing again.
+      const failures = bumpWriterFail(deps.db, target.sessionID)
+      reportFailure(
+        deps,
+        "error",
+        `writer produced no output session=${target.sessionID} consecutive_failures=${failures} limit=${deps.maxWriterRetries ?? 3}`,
+      )
       await removeOrphan(deps.root, childSessionID)
       return true
     }
     const checkpointFile = checkpointPath(deps.root, target.sessionID)
-    const body = result.endsWith("CHECKPOINT_DONE") ? result.replace(/CHECKPOINT_DONE\s*$/, "").trim() : result
-    if (validateCheckpoint(body).ok) {
-      writeMemoryFile(checkpointFile, body)
-      markCheckpoint(deps.db, target.sessionID)
-      appendProjectMemory(deps.root, target.projectDir, body)
+    // The delta block is machine-readable and must not reach any memory file:
+    // the checkpoint markdown and the append fallback both get it stripped.
+    const body = stripDelta(result)
+      .replace(/CHECKPOINT_DONE\s*$/, "")
+      .trim()
+    const verdict = validateCheckpoint(body)
+    if (!verdict.ok) {
+      reportFailure(
+        deps,
+        "error",
+        `checkpoint rejected session=${target.sessionID} errors=${JSON.stringify(verdict.errors)}`,
+      )
+      await removeOrphan(deps.root, childSessionID)
+      return true
+    }
+    for (const w of verdict.warnings) {
+      reportFailure(deps, "warn", `checkpoint section budget session=${target.sessionID} ${w}`)
+    }
+
+    // Write both files before touching the watermark. Advancing the watermark
+    // mid-sequence used to lose the project-memory append permanently: the
+    // increment is never re-read once the watermark moves past it. Only advance
+    // when every write landed, so a failure is retried on the next trigger.
+    //
+    // The mtime guard drops a late result: if the checkpoint file is already
+    // newer than this settle began, another trigger for the same session
+    // finished later and its content is the fresher one. The project append
+    // still runs — this result covers a window that may not be recorded yet.
+    const written = checkpointFileMtime(checkpointFile)
+    const stale = written !== null && written > settleStart
+    if (stale) {
+      reportFailure(
+        deps,
+        "warn",
+        `checkpoint write skipped as stale session=${target.sessionID} file_mtime=${new Date(written).toISOString()} settle_start=${new Date(settleStart).toISOString()}`,
+      )
+    }
+    const checkpointWrite = stale ? { ok: true as const } : writeMemoryFile(checkpointFile, body)
+    if (!checkpointWrite.ok) {
+      reportFailure(
+        deps,
+        "error",
+        `checkpoint write failed session=${target.sessionID} path=${checkpointFile} reason=${checkpointWrite.reason}`,
+      )
+    }
+    // Project memory: prefer the sectioned merge. A missing or malformed delta
+    // block falls back to the 0.4.x append rather than dropping the result —
+    // the append is noisier but lossless, which is the right failure direction.
+    let projectWrite = true
+    let usedMerge = false
+    if (target.projectDir) {
+      const delta = extractDelta(result)
+      if (delta) {
+        const merged = mergeProjectMemory(deps.root, target.projectDir, delta, deps.db, target.sessionID, settleStart)
+        projectWrite = merged.ok
+        usedMerge = merged.ok
+        if (merged.ok && merged.truncatedLines > 0) {
+          reportFailure(
+            deps,
+            "warn",
+            `project memory truncated session=${target.sessionID} lines=${merged.truncatedLines} caps=${JSON.stringify(SECTION_CAPS)}`,
+          )
+        }
+        if (!merged.ok) {
+          reportFailure(
+            deps,
+            "warn",
+            `project memory merge failed, falling back to append session=${target.sessionID}`,
+          )
+        }
+      } else if (result.includes("<!-- project-memory-delta")) {
+        // The block was emitted but unparseable. Logged because otherwise the
+        // sectioned layout silently degrades to append mode for the rest of
+        // time and nothing points at the prompt instruction being violated.
+        reportFailure(
+          deps,
+          "warn",
+          `project memory delta block present but unparseable, appending instead session=${target.sessionID}`,
+        )
+      }
+      if (!usedMerge) {
+        projectWrite = appendProjectMemory(deps.root, target.projectDir, body, deps.db, target.sessionID, settleStart)
+      }
+    }
+    if (!projectWrite) {
+      reportFailure(
+        deps,
+        "error",
+        `project memory append failed session=${target.sessionID} dir=${target.projectDir}`,
+      )
+    }
+    if (checkpointWrite.ok && projectWrite) {
+      markCheckpoint(deps.db, target.sessionID, settleStart)
+      clearWriterFail(deps.db, target.sessionID)
+    } else {
+      const failures = bumpWriterFail(deps.db, target.sessionID)
+      reportFailure(
+        deps,
+        "error",
+        `watermark not advanced session=${target.sessionID} consecutive_failures=${failures} limit=${deps.maxWriterRetries ?? 3}; next trigger will retry this increment`,
+      )
     }
     await removeOrphan(deps.root, childSessionID)
   } catch (e) {
@@ -241,17 +421,97 @@ export function checkpointPath(root: string, sessionID: string): string {
   return buildPath({ root, scope: "sessions", scope_id: sessionID, key: "checkpoint" })
 }
 
-export function appendProjectMemory(root: string, projectDir: string | undefined, body: string): boolean {
+function checkpointFileMtime(file: string): number | null {
+  try {
+    return fs.statSync(file).mtimeMs
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Append a settled checkpoint to the project memory.
+ *
+ * Two guards, because the tail comparison alone was not enough once failures
+ * became retryable: a retry re-runs the same checkpoint, and by then other
+ * content may already sit at the tail, so `endsWith` misses it. The
+ * `project_appended:<pid>` watermark is order-independent — if this result's
+ * window is not newer than what the project file already covers, the content is
+ * already recorded. The tail check stays as the guard for calls that carry no
+ * watermark (direct/test use) and for pre-watermark history.
+ */
+export function appendProjectMemory(
+  root: string,
+  projectDir: string | undefined,
+  body: string,
+  db?: Db,
+  sessionID?: string,
+  watermarkMs?: number,
+): boolean {
   if (!projectDir) return false
   const normalizedBody = body.trim()
   if (!normalizedBody) return false
+  ensureMemoryTemplate(root, projectDir)
   const pid = resolveProjectId(projectDir)
+  if (db && sessionID && typeof watermarkMs === "number") {
+    const covered = Number(metaGet(db, `${APPEND_KEY_PREFIX}${pid}`) ?? "0")
+    if (Number.isFinite(covered) && watermarkMs <= covered) return true
+  }
   const p = buildPath({ root, scope: "projects", scope_id: pid, key: "MEMORY" })
   const existing = readMemoryFile(p) ?? ""
   const normalizedExisting = existing.trimEnd()
-  if (normalizedExisting === normalizedBody || normalizedExisting.endsWith(`\n\n${normalizedBody}`)) return true
+  if (normalizedExisting === normalizedBody || normalizedExisting.endsWith(`\n\n${normalizedBody}`)) {
+    if (db && sessionID && typeof watermarkMs === "number") {
+      metaSet(db, `${APPEND_KEY_PREFIX}${pid}`, String(watermarkMs))
+    }
+    return true
+  }
   const merged = existing ? `${existing}\n\n${normalizedBody}` : normalizedBody
-  return writeMemoryFile(p, merged).ok
+  const written = writeMemoryFile(p, merged).ok
+  if (written && db && sessionID && typeof watermarkMs === "number") {
+    metaSet(db, `${APPEND_KEY_PREFIX}${pid}`, String(watermarkMs))
+  }
+  return written
+}
+
+/**
+ * Merge a writer delta into the four sections of the project memory. Returns
+ * false when there is no delta to apply or the write failed, so the caller can
+ * fall back to the 0.4.x append and never drop the result.
+ */
+export function mergeProjectMemory(
+  root: string,
+  projectDir: string | undefined,
+  delta: MemoryDelta,
+  db?: Db,
+  sessionID?: string,
+  watermarkMs?: number,
+): { ok: boolean; truncatedLines: number } {
+  if (!projectDir) return { ok: false, truncatedLines: 0 }
+  const pid = resolveProjectId(projectDir)
+  if (db && sessionID && typeof watermarkMs === "number") {
+    const covered = Number(metaGet(db, `${APPEND_KEY_PREFIX}${pid}`) ?? "0")
+    if (Number.isFinite(covered) && watermarkMs <= covered) return { ok: true, truncatedLines: 0 }
+  }
+  const p = buildPath({ root, scope: "projects", scope_id: pid, key: "MEMORY" })
+  const existing = readMemoryFile(p) ?? ""
+  const current = parseMemorySections(existing)
+  const merged: MemoryDelta = emptyDelta()
+  let truncation = 0
+  for (const name of MEMORY_SECTIONS) {
+    const addition = normalizeBullets(delta[name]?.trim() ?? "")
+    const combined = addition ? (current[name] ? `${current[name]}\n\n${addition}` : addition) : current[name]
+    const capped = capSection(combined, SECTION_CAPS[name])
+    truncation += capped.truncated
+    merged[name] = capped.text
+  }
+  const written = writeMemoryFile(p, renderMemorySections(projectDir, merged))
+  if (!written.ok) return { ok: false, truncatedLines: truncation }
+  if (db && sessionID && typeof watermarkMs === "number") {
+    metaSet(db, `${APPEND_KEY_PREFIX}${pid}`, String(watermarkMs))
+  }
+  markLayout(db as Db, pid)
+  return { ok: true, truncatedLines: truncation }
 }
 
 function orphanFile(root: string): string {

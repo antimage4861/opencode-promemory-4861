@@ -1,6 +1,7 @@
 export interface MemoryPluginConfig {
   disableWrite?: boolean
   writerTimeoutMs?: number
+  writerMaxRetries?: number
   retentionDays?: number
   retentionCleanupIntervalDays?: number
   memoryReconcileOnSearch?: boolean
@@ -13,6 +14,7 @@ export interface MemoryPluginConfig {
 export interface ResolvedConfig {
   disableWrite: boolean
   writerTimeoutMs: number
+  writerMaxRetries: number
   retentionDays: number
   retentionCleanupIntervalMs: number
   memoryReconcileOnSearch: boolean
@@ -25,6 +27,7 @@ export interface ResolvedConfig {
 export const DEFAULTS: ResolvedConfig = {
   disableWrite: false,
   writerTimeoutMs: 120_000,
+  writerMaxRetries: 3,
   retentionDays: 0,
   retentionCleanupIntervalMs: 24 * 60 * 60 * 1000,
   memoryReconcileOnSearch: true,
@@ -56,6 +59,7 @@ export function resolveConfig(raw: MemoryPluginConfig | undefined): ResolvedConf
   return {
     disableWrite: pick("disableWrite") ?? envBool("DISABLE_WRITE") ?? DEFAULTS.disableWrite,
     writerTimeoutMs: pick("writerTimeoutMs") ?? envNum("WRITER_TIMEOUT_MS") ?? DEFAULTS.writerTimeoutMs,
+    writerMaxRetries: pick("writerMaxRetries") ?? envNum("WRITER_MAX_RETRIES") ?? DEFAULTS.writerMaxRetries,
     retentionDays: pick("retentionDays") ?? envNum("RETENTION_DAYS") ?? DEFAULTS.retentionDays,
     retentionCleanupIntervalMs:
       (pick("retentionCleanupIntervalDays") as number | undefined) ??

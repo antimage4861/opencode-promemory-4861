@@ -1,3 +1,26 @@
+# 0.5.0 (2026-09-27)
+
+- **BREAKING:项目记忆改为分段结构化写入**。此前 writer 把每份 checkpoint 原文整份追加进 `projects/<pid>/MEMORY.md`,使该文件变成变更日志:无界增长、同一结论被反复重述、BM25 相关度被过程性内容(文件清单、命令流水)稀释,而真正值得进项目记忆的结论被埋在下面。
+  - 四个知识段:`Project context` / `Rules` / `Architecture decisions` / `Discovered durable knowledge`,各段独立字节预算 3000 / 5000 / 8000 / 10000。
+  - **写入主体仍是宿主**:writer 子代理只返回一段 delta JSON,宿主解析、合并、裁剪、落盘。0.3.0 刻意把子代理工具白名单收紧为空以杜绝蒸馏污染,直接给子代理 `write` 权限会破坏该决定,故不采用 MiMoCode 的写法。
+  - delta 块缺失或损坏时**退回旧的整份追加路径**并记 warn,优先「有损但不丢数据」。子会话返回了 delta 块却无法解析时同样记 warn,否则分段布局会静默退化成追加模式而无从追查。
+  - 段落超预算时保留**最新**内容、裁掉头部,裁剪量记 warn。
+  - checkpoint 正文与追加内容都会剥离 delta 块,机器可读内容不进任何记忆文件。
+  - `migrateMemoryLayout` 幂等迁移:已分段的跳过,缺分类结果时**拒绝猜测**(返回 `needs-classification`)。归类属判断题,由调用方提供已分类文本,代码只负责建结构。
+  - 本仓库自身的 `MEMORY.md` 已完成迁移:29060 → 9998 字节,19KB 原始 checkpoint 流水清除(内容本就是冗余,已存于 `sessions/<sid>/checkpoint.md` 与 `history.db`),原文件备份为 `MEMORY.md.pre-v1-sections`。
+- 三个静默失真点一并修复(见下方 0.4.1 之后的 fix 提交):水位单调不后退、迟到结算结果不覆盖更新的 checkpoint、失败重试上限。
+
+# 0.4.1 (2026-09-27)
+
+- **修复:writer 静默失败**。校验失败与写入失败全程无日志、返回值被丢弃,checkpoint 会无声消失;水位又在两次写入**中间**推进,项目记忆追加失败时增量永久丢失且不会被重试。
+  - 校验拒绝、文件写入失败、项目记忆追加失败、水位未推进,四类情况统一经 `client.app.log` 上报(`service: project-memory`)。
+  - 调整顺序为「写 checkpoint → 追加项目记忆 → 推进水位」,两个写入都成功才推进水位;失败则水位不动,下次触发自动重试该增量。`projectDir` 缺失时视为成功,避免无限重试。
+  - 新增按 section 的字节预算检查(Summary 800 / Decisions 1500 / Facts 2000 / Open 800 / Files 1500 / Notes 800),**超限只 warn 不 reject** —— 拒绝等于静默丢数据,与本次修复目标相反。预算合计 7400,留足 10KB 总量约束的余量。
+  - `npm test` 增至 9 个用例,新增覆盖:校验拒绝留痕且水位不动、超预算仍落盘、IO 失败不推进水位、模板只写一次。
+- **新增:项目记忆起步模板**。`ensureMemoryTemplate` 在某项目首次沉淀时写入标题与维护说明骨架,幂等(文件已存在不动)。此前新项目的 `MEMORY.md` 由第一份 checkpoint 直接充当,没有可读的抬头。
+- **文档:纠正 notes / global 的错误承诺**。README 与 `memory` 工具描述此前宣称可检索 `notes` / `free` / `global`,但插件只有 checkpoint 与项目记忆两个写入点,`memory` 工具是纯只读(仅 `search`),这三个类型永远为空。现明确标注为「已预留但无写入端」。
+- 下一版(0.5.0)计划把 `MEMORY.md` 从「整份 checkpoint 追加」改为分段结构化写入,需配套迁移。
+
 # 0.4.0 (2026-09-27)
 
 - **BREAKING:移除「1h 空闲自动沉淀」通道**。checkpoint 触发通道由三个收敛为两个:**压缩前自动沉淀** / **手动 `/mem-checkpoint`**。

@@ -86,6 +86,7 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
     settling: settlingWriters,
     finalizing: finalizingWriters,
     projectDir: directory ?? undefined,
+    maxWriterRetries: cfg.writerMaxRetries,
   }
 
   const sessionsProvider = async () => {
