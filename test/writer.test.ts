@@ -5,6 +5,7 @@ import path from "node:path"
 import { resolveProjectId } from "../src/memory/paths.ts"
 import { projectMemoryTemplate } from "../src/memory/template.ts"
 import { GLOBAL_CAP, SECTION_CAPS, extractDelta, mergeGlobalMemory, migrateMemoryLayout, normalizeBullets } from "../src/memory/merge.ts"
+import { describeDreamDiff, diffProjectMemory, snapshotProjectMemory } from "../src/session/dream.ts"
 import type { Db } from "../src/memory/db.ts"
 import {
   bumpWriterFail,
@@ -746,5 +747,60 @@ describe("delta block content tolerance", () => {
   test("returns null when no recognised heading carries content", () => {
     expect(extractDelta("<!-- project-memory-delta\n## 空的\n-->\n")).toBeNull()
     expect(extractDelta("没有 delta 块")).toBeNull()
+  })
+})
+
+describe("dream verification", () => {
+  const memoryOf = (root: string, projectDir: string) =>
+    path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md")
+
+  test("reports a revision: lines removed and added are both counted", () => {
+    const root = tempRoot()
+    const projectDir = path.join(root, "project")
+    const p = memoryOf(root, projectDir)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, ["## Rules", "- 旧事实：格式是 JSON", "- 保留事实", ""].join("\n"), "utf8")
+    const snap = snapshotProjectMemory(root, projectDir)
+    expect(snap).not.toBeNull()
+    // dream 修订：删掉过时那条，改写另一条，再加一条新的
+    fs.writeFileSync(p, ["## Rules", "- 保留事实", "- 新事实：格式是 markdown", ""].join("\n"), "utf8")
+    const diff = diffProjectMemory(snap, root)!
+    expect(diff.changed).toBe(true)
+    expect(diff.removed).toBe(1)
+    expect(diff.added).toBe(1)
+    expect(diff.linesBefore).toBe(3)
+    expect(diff.linesAfter).toBe(3)
+    expect(describeDreamDiff(diff)).toContain("删 1 行 / 增 1 行")
+  })
+
+  test("flags an append-only run, which is not a revision", () => {
+    const root = tempRoot()
+    const projectDir = path.join(root, "project")
+    const p = memoryOf(root, projectDir)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, "## Rules\n- 既有事实\n", "utf8")
+    const snap = snapshotProjectMemory(root, projectDir)
+    fs.writeFileSync(p, "## Rules\n- 既有事实\n- 只有新增\n", "utf8")
+    const text = describeDreamDiff(diffProjectMemory(snap, root)!)
+    expect(text).toContain("只有新增没有删除")
+  })
+
+  test("flags a no-op run instead of reporting success", () => {
+    const root = tempRoot()
+    const projectDir = path.join(root, "project")
+    const p = memoryOf(root, projectDir)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, "## Rules\n- 既有事实\n", "utf8")
+    const snap = snapshotProjectMemory(root, projectDir)
+    const text = describeDreamDiff(diffProjectMemory(snap, root)!)
+    expect(text).toContain("未改动项目记忆")
+    expect(text).toContain("说明它没有生效")
+  })
+
+  test("returns null when there is no project memory to snapshot", () => {
+    const root = tempRoot()
+    expect(snapshotProjectMemory(root, path.join(root, "nope"))).toBeNull()
+    expect(snapshotProjectMemory(root, undefined)).toBeNull()
+    expect(diffProjectMemory(null, tempRoot())).toBeNull()
   })
 })
