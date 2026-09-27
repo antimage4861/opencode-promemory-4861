@@ -8,6 +8,7 @@ import {
   SECTION_CAPS,
   capSection,
   emptyDelta,
+  normalizeBullets,
   extractDelta,
   markLayout,
   parseMemorySections,
@@ -498,7 +499,7 @@ export function mergeProjectMemory(
   const merged: MemoryDelta = emptyDelta()
   let truncation = 0
   for (const name of MEMORY_SECTIONS) {
-    const addition = delta[name]?.trim()
+    const addition = normalizeBullets(delta[name]?.trim() ?? "")
     const combined = addition ? (current[name] ? `${current[name]}\n\n${addition}` : addition) : current[name]
     const capped = capSection(combined, SECTION_CAPS[name])
     truncation += capped.truncated

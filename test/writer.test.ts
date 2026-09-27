@@ -4,7 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { resolveProjectId } from "../src/memory/paths.ts"
 import { projectMemoryTemplate } from "../src/memory/template.ts"
-import { SECTION_CAPS, migrateMemoryLayout } from "../src/memory/merge.ts"
+import { SECTION_CAPS, migrateMemoryLayout, normalizeBullets } from "../src/memory/merge.ts"
 import type { Db } from "../src/memory/db.ts"
 import {
   bumpWriterFail,
@@ -564,5 +564,23 @@ describe("layout migration", () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
+  })
+})
+
+describe("bullet normalization", () => {
+  test("splits a squashed bullet run onto separate lines", () => {
+    expect(normalizeBullets("- 第一条。- 第二条。- 第三条。")).toBe("- 第一条。\n- 第二条。\n- 第三条。")
+  })
+
+  test("leaves ordinary prose and dash usage alone", () => {
+    const prose = "- 端口 6379 - 密码 securepass，另一项 - 还要写"
+    expect(normalizeBullets(prose)).toBe(prose)
+    expect(normalizeBullets("- 范围 session → project → global")).toBe("- 范围 session → project → global")
+    expect(normalizeBullets("无 bullet 的段落")).toBe("无 bullet 的段落")
+  })
+
+  test("keeps a real multi-line list untouched", () => {
+    const list = "- 一\n- 二\n- 三"
+    expect(normalizeBullets(list)).toBe(list)
   })
 })

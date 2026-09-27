@@ -92,6 +92,26 @@ export function renderMemorySections(dirLabel: string, sections: MemoryDelta): s
 }
 
 /**
+ * Split squashed bullet runs. The writer occasionally emits several bullets on
+ * one line ("- a。- b。- c。"), which BM25 then reads as a single very heavy
+ * term instead of three independent facts. The pattern requires the dash to
+ * touch the preceding character, so ordinary prose ("端口 6379 - 密码 x") and
+ * any real dash usage is left alone; a false split only costs a line break.
+ */
+export function normalizeBullets(text: string): string {
+  if (!text.includes("- ")) return text
+  const out: string[] = []
+  for (const line of text.split("\n")) {
+    if (!/(?<=\S)- (?=\S)/.test(line)) {
+      out.push(line)
+      continue
+    }
+    out.push(...line.replace(/(?<=\S)- (?=\S)/g, "\n- ").split("\n"))
+  }
+  return out.join("\n")
+}
+
+/**
  * Keep the newest content when a section outgrows its budget. Sections are
  * appended to, so the tail holds the most recent decisions; the head is what
  * gets cut, and the cut is reported so the loss is visible rather than silent.
