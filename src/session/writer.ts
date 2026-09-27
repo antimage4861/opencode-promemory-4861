@@ -4,7 +4,9 @@ import { buildPath, resolveProjectId } from "../memory/paths.ts"
 import { writeMemoryFile, readMemoryFile, withFileLock } from "../memory/storage.ts"
 import { ensureMemoryTemplate } from "../memory/template.ts"
 import {
+  GLOBAL_CAP,
   MEMORY_SECTIONS,
+  mergeGlobalMemory,
   SECTION_CAPS,
   capSection,
   emptyDelta,
@@ -309,22 +311,50 @@ async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childS
     if (target.projectDir) {
       const delta = extractDelta(result)
       if (delta) {
-        const merged = mergeProjectMemory(deps.root, target.projectDir, delta, deps.db, target.sessionID, settleStart)
-        projectWrite = merged.ok
-        usedMerge = merged.ok
-        if (merged.ok && merged.truncatedLines > 0) {
-          reportFailure(
-            deps,
-            "warn",
-            `project memory truncated session=${target.sessionID} lines=${merged.truncatedLines} caps=${JSON.stringify(SECTION_CAPS)}`,
+        const hasProject = MEMORY_SECTIONS.some((n) => delta.project[n])
+        // A global-only delta must still advance the project watermark, or the
+        // increment is re-distilled forever. The project file is only rewritten
+        // when this increment actually has something to say about the project.
+        if (hasProject) {
+          const merged = mergeProjectMemory(
+            deps.root,
+            target.projectDir,
+            delta.project,
+            deps.db,
+            target.sessionID,
+            settleStart,
           )
+          projectWrite = merged.ok
+          usedMerge = merged.ok
+          if (merged.ok && merged.truncatedLines > 0) {
+            reportFailure(
+              deps,
+              "warn",
+              `project memory truncated session=${target.sessionID} lines=${merged.truncatedLines} caps=${JSON.stringify(SECTION_CAPS)}`,
+            )
+          }
+          if (!merged.ok) {
+            reportFailure(
+              deps,
+              "warn",
+              `project memory merge failed, falling back to append session=${target.sessionID}`,
+            )
+          }
+        } else {
+          usedMerge = true
         }
-        if (!merged.ok) {
-          reportFailure(
-            deps,
-            "warn",
-            `project memory merge failed, falling back to append session=${target.sessionID}`,
-          )
+        if (delta.global) {
+          const global = mergeGlobalMemory(deps.root, delta.global, deps.db, settleStart)
+          if (global.truncatedLines > 0) {
+            reportFailure(
+              deps,
+              "warn",
+              `global memory truncated session=${target.sessionID} lines=${global.truncatedLines} cap=${GLOBAL_CAP}`,
+            )
+          }
+          if (!global.ok) {
+            reportFailure(deps, "error", `global memory merge failed session=${target.sessionID}`)
+          }
         }
       } else if (result.includes("<!-- project-memory-delta")) {
         // The block was emitted but unparseable. Logged because otherwise the
