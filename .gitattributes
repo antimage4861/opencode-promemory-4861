@@ -1,0 +1,15 @@
+# 行尾统一由仓库决定，不再依赖每台机器的 core.autocrlf。
+#
+# 此前缺这个文件的后果：索引里存 LF、工作区按本机 autocrlf 转换，于是同一
+# 个仓库在不同机器上工作区行尾不同（Windows 上多为 CRLF，新 clone 的文件
+# 却是 LF），git 持续输出 "LF will be replaced by CRLF" 警告，并且会在
+# stat 缓存与归一化之间出现内容零差异的幽灵 modified（deploy 侧的
+# config.ts 就因此被反复误报为已修改）。
+#
+# 本仓库不含 .ps1 / .bat / .cmd 等 Windows 专用脚本，统一 LF 对它们无影响；
+# 未来新增这类文件时在此处按需加 eol=crlf 例外。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.tgz binary
