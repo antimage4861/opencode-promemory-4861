@@ -6,6 +6,12 @@ import { resolveProjectId } from "../src/memory/paths.ts"
 import { projectMemoryTemplate } from "../src/memory/template.ts"
 import type { Db } from "../src/memory/db.ts"
 import {
+  bumpWriterFail,
+  clearWriterFail,
+  writerFailCount,
+  markCheckpoint,
+  lastCheckpointMs,
+  runWriter,
   appendProjectMemory,
   checkpointPath,
   finalizeWriter,
@@ -65,6 +71,7 @@ function createDeps(root: string, db: Db, messages: () => Promise<unknown>): Wri
     settling: new Map<string, Promise<boolean>>(),
     finalizing: new Map<string, Promise<boolean>>(),
     projectDir: root,
+    maxWriterRetries: 3,
   }
 }
 
@@ -277,6 +284,121 @@ describe("project memory template", () => {
       const second = fs.readFileSync(memoryPath, "utf8")
       expect(second).toBe(`${first}\n\n${extra}`)
       expect(second.split(projectMemoryTemplate(projectDir))).toHaveLength(2)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("watermark monotonicity", () => {
+  test("never moves backwards", () => {
+    const { db } = createDb()
+    expect(markCheckpoint(db, "s1", 2000)).toBe(true)
+    expect(markCheckpoint(db, "s1", 1000)).toBe(false)
+    expect(lastCheckpointMs(db, "s1")).toBe(2000)
+    expect(markCheckpoint(db, "s1", 3000)).toBe(true)
+    expect(lastCheckpointMs(db, "s1")).toBe(3000)
+  })
+})
+
+describe("late settle guard", () => {
+  test("does not let a stale result overwrite a newer checkpoint file", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const stale = `${checkpoint}\n\n## 补充\n- 迟到结果带来的额外内容`
+    const fresh = "# Checkpoint\n## Summary\n更新的内容\n"
+    // 先落一份较新的文件，再让一次更早开始时刻的结算跑完
+    const { deps, logs } = createLoggedDeps(root, db, okMessages(stale))
+    const target = createTarget(root)
+    try {
+      fs.mkdirSync(path.join(root, "sessions", target.sessionID), { recursive: true })
+      fs.writeFileSync(checkpointPath(root, target.sessionID), fresh, "utf8")
+      const future = new Date(Date.now() + 10_000)
+      fs.utimesSync(checkpointPath(root, target.sessionID), future, future)
+      await finalizeWriter(deps, target, "child-stale")
+      expect(fs.readFileSync(checkpointPath(root, target.sessionID), "utf8")).toBe(fresh)
+      expect(logs.some((l) => l.message.includes("skipped as stale"))).toBe(true)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("project append idempotency", () => {
+  test("skips a window the project file already covers, even mid-file", () => {
+    const root = tempRoot()
+    const projectDir = path.join(root, "project")
+    const memoryPath = path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md")
+    const { db, values } = createDb()
+    try {
+      expect(appendProjectMemory(root, projectDir, "第一段", db, "s1", 1000)).toBe(true)
+      expect(appendProjectMemory(root, projectDir, "第二段", db, "s2", 2000)).toBe(true)
+      const afterTwo = fs.readFileSync(memoryPath, "utf8")
+      // 重放第一段：水位更旧，且不在尾部，尾���比对会漏掉
+      expect(appendProjectMemory(root, projectDir, "第一段", db, "s1", 1000)).toBe(true)
+      expect(fs.readFileSync(memoryPath, "utf8")).toBe(afterTwo)
+      expect(values.get(`project_appended:${resolveProjectId(projectDir)}`)).toBe("2000")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("writer retry cap", () => {
+  test("suppresses dispatch once consecutive failures reach the limit", async () => {
+    const root = tempRoot()
+    const { db, values } = createDb()
+    let createCalls = 0
+    const { deps, logs } = createLoggedDeps(root, db, okMessages(checkpoint))
+    deps.client = {
+      session: {
+        messages: async () => ({ data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "父会话增量内容" }] }] }),
+        create: async () => {
+          createCalls += 1
+          return { data: { id: "spawned" } }
+        },
+        promptAsync: async () => ({ data: true }),
+        status: async () => ({ data: { status: { type: "idle" } } }),
+      },
+      app: { log: (a: { body: { level: string; message: string } }) => { logs.push({ level: a.body.level, message: a.body.message }); return Promise.resolve() } },
+    } as unknown as WriterDeps["client"]
+    const target = createTarget(root)
+    const state = new Map<string, PendingWriter>()
+    try {
+      // 未达上限：正常派发
+      runWriter(target, deps, state)
+      await Bun.sleep(50)
+      expect(createCalls).toBe(1)
+      expect(logs.some((l) => l.message.includes("writer suppressed"))).toBe(false)
+
+      // 连续失败到上限：闸门拦下派发
+      state.clear()
+      bumpWriterFail(db, target.sessionID)
+      bumpWriterFail(db, target.sessionID)
+      bumpWriterFail(db, target.sessionID)
+      expect(writerFailCount(db, target.sessionID)).toBe(3)
+      runWriter(target, deps, state)
+      expect(createCalls).toBe(1)
+      expect(logs.some((l) => l.message.includes("writer suppressed"))).toBe(true)
+
+      // 一次成功后计数清零
+      clearWriterFail(db, target.sessionID)
+      expect(writerFailCount(db, target.sessionID)).toBe(0)
+      expect(values.has(`writer_fail:${target.sessionID}`)).toBe(true)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("counts an empty child reply as a failure", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const { deps, logs } = createLoggedDeps(root, db, okMessages(""))
+    const target = createTarget(root)
+    try {
+      await finalizeWriter(deps, target, "child-empty")
+      expect(writerFailCount(db, target.sessionID)).toBe(1)
+      expect(logs.some((l) => l.message.includes("produced no output"))).toBe(true)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }

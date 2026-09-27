@@ -10,6 +10,8 @@ import { metaGet, metaSet } from "../memory/fts.ts"
 const INCREMENT_BUDGET = 24_000
 const WRITER_SYSTEM_BUDGET = 6_000
 const CP_KEY_PREFIX = "scanner:"
+const FAIL_KEY_PREFIX = "writer_fail:"
+const APPEND_KEY_PREFIX = "project_appended:"
 
 interface OrphanRecord {
   childSessionID: string
@@ -34,6 +36,7 @@ export interface WriterDeps {
   settling: Map<string, Promise<boolean>>
   finalizing: Map<string, Promise<boolean>>
   projectDir?: string
+  maxWriterRetries: number
 }
 
 export interface PendingWriter {
@@ -64,8 +67,33 @@ function reportFailure(deps: WriterDeps, level: "warn" | "error", message: strin
   }
 }
 
-export function markCheckpoint(db: Db, sessionID: string, ms = Date.now()) {
-  metaSet(db, `${CP_KEY_PREFIX}${sessionID}`, String(ms))
+/**
+ * Advance the watermark, never backwards. Two writer children for the same
+ * session can settle out of order (different compaction / manual triggers);
+ * an unconditional Date.now() meant the later-to-settle one pushed the mark
+ * past a window the other had not recorded yet, skipping it for good.
+ */
+export function markCheckpoint(db: Db, sessionID: string, ms = Date.now()): boolean {
+  const key = `${CP_KEY_PREFIX}${sessionID}`
+  if (lastCheckpointMs(db, sessionID) >= ms) return false
+  metaSet(db, key, String(ms))
+  return true
+}
+
+export function writerFailCount(db: Db, sessionID: string): number {
+  const raw = metaGet(db, `${FAIL_KEY_PREFIX}${sessionID}`)
+  const n = raw ? Number(raw) : NaN
+  return Number.isFinite(n) ? n : 0
+}
+
+export function bumpWriterFail(db: Db, sessionID: string): number {
+  const next = writerFailCount(db, sessionID) + 1
+  metaSet(db, `${FAIL_KEY_PREFIX}${sessionID}`, String(next))
+  return next
+}
+
+export function clearWriterFail(db: Db, sessionID: string): void {
+  metaSet(db, `${FAIL_KEY_PREFIX}${sessionID}`, "0")
 }
 
 async function readIncrement(deps: WriterDeps, target: WriterTarget): Promise<{
@@ -165,10 +193,24 @@ async function watchChildCompletion(deps: WriterDeps, state: Map<string, Pending
 
 export function runWriter(task: WriterTarget, deps: WriterDeps, state: Map<string, PendingWriter>): void {
   if (state.has(task.sessionID)) return
+  // Retry cap. Without it a permanently broken target (disk full, read-only
+  // mount) re-distilled on every single trigger, burning a subagent each time
+  // to produce output that can never land. Checked before spawning, not after
+  // failing, so the token cost is what we avoid.
+  const failures = writerFailCount(deps.db, task.sessionID)
+  if (failures >= deps.maxWriterRetries) {
+    reportFailure(
+      deps,
+      "error",
+      `writer suppressed session=${task.sessionID} consecutive_failures=${failures} limit=${deps.maxWriterRetries}`,
+    )
+    return
+  }
   void spawnWriter(deps, task, state)
 }
 
 async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childSessionID: string): Promise<boolean> {
+  const settleStart = Date.now()
   try {
     const res = await deps.client.session.messages({ path: { id: childSessionID } })
     const messages = (res?.data ?? []) as Array<{
@@ -184,6 +226,15 @@ async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childS
     }
     const result = assistantTexts.join("\n").trim()
     if (!result) {
+      // Counts as a failure: a child that produced nothing is a failed
+      // distillation, and without this the retry cap never engages — the next
+      // trigger would spawn another subagent to produce nothing again.
+      const failures = bumpWriterFail(deps.db, target.sessionID)
+      reportFailure(
+        deps,
+        "error",
+        `writer produced no output session=${target.sessionID} consecutive_failures=${failures} limit=${deps.maxWriterRetries}`,
+      )
       await removeOrphan(deps.root, childSessionID)
       return true
     }
@@ -207,7 +258,21 @@ async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childS
     // mid-sequence used to lose the project-memory append permanently: the
     // increment is never re-read once the watermark moves past it. Only advance
     // when every write landed, so a failure is retried on the next trigger.
-    const checkpointWrite = writeMemoryFile(checkpointFile, body)
+    //
+    // The mtime guard drops a late result: if the checkpoint file is already
+    // newer than this settle began, another trigger for the same session
+    // finished later and its content is the fresher one. The project append
+    // still runs — this result covers a window that may not be recorded yet.
+    const written = checkpointFileMtime(checkpointFile)
+    const stale = written !== null && written > settleStart
+    if (stale) {
+      reportFailure(
+        deps,
+        "warn",
+        `checkpoint write skipped as stale session=${target.sessionID} file_mtime=${new Date(written).toISOString()} settle_start=${new Date(settleStart).toISOString()}`,
+      )
+    }
+    const checkpointWrite = stale ? { ok: true as const } : writeMemoryFile(checkpointFile, body)
     if (!checkpointWrite.ok) {
       reportFailure(
         deps,
@@ -216,7 +281,7 @@ async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childS
       )
     }
     const projectWrite = target.projectDir
-      ? appendProjectMemory(deps.root, target.projectDir, body)
+      ? appendProjectMemory(deps.root, target.projectDir, body, deps.db, target.sessionID, settleStart)
       : true
     if (!projectWrite) {
       reportFailure(
@@ -226,12 +291,14 @@ async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childS
       )
     }
     if (checkpointWrite.ok && projectWrite) {
-      markCheckpoint(deps.db, target.sessionID)
+      markCheckpoint(deps.db, target.sessionID, settleStart)
+      clearWriterFail(deps.db, target.sessionID)
     } else {
+      const failures = bumpWriterFail(deps.db, target.sessionID)
       reportFailure(
         deps,
         "error",
-        `watermark not advanced session=${target.sessionID}; next trigger will retry this increment`,
+        `watermark not advanced session=${target.sessionID} consecutive_failures=${failures} limit=${deps.maxWriterRetries}; next trigger will retry this increment`,
       )
     }
     await removeOrphan(deps.root, childSessionID)
@@ -297,18 +364,57 @@ export function checkpointPath(root: string, sessionID: string): string {
   return buildPath({ root, scope: "sessions", scope_id: sessionID, key: "checkpoint" })
 }
 
-export function appendProjectMemory(root: string, projectDir: string | undefined, body: string): boolean {
+function checkpointFileMtime(file: string): number | null {
+  try {
+    return fs.statSync(file).mtimeMs
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Append a settled checkpoint to the project memory.
+ *
+ * Two guards, because the tail comparison alone was not enough once failures
+ * became retryable: a retry re-runs the same checkpoint, and by then other
+ * content may already sit at the tail, so `endsWith` misses it. The
+ * `project_appended:<pid>` watermark is order-independent — if this result's
+ * window is not newer than what the project file already covers, the content is
+ * already recorded. The tail check stays as the guard for calls that carry no
+ * watermark (direct/test use) and for pre-watermark history.
+ */
+export function appendProjectMemory(
+  root: string,
+  projectDir: string | undefined,
+  body: string,
+  db?: Db,
+  sessionID?: string,
+  watermarkMs?: number,
+): boolean {
   if (!projectDir) return false
   const normalizedBody = body.trim()
   if (!normalizedBody) return false
   ensureMemoryTemplate(root, projectDir)
   const pid = resolveProjectId(projectDir)
+  if (db && sessionID && typeof watermarkMs === "number") {
+    const covered = Number(metaGet(db, `${APPEND_KEY_PREFIX}${pid}`) ?? "0")
+    if (Number.isFinite(covered) && watermarkMs <= covered) return true
+  }
   const p = buildPath({ root, scope: "projects", scope_id: pid, key: "MEMORY" })
   const existing = readMemoryFile(p) ?? ""
   const normalizedExisting = existing.trimEnd()
-  if (normalizedExisting === normalizedBody || normalizedExisting.endsWith(`\n\n${normalizedBody}`)) return true
+  if (normalizedExisting === normalizedBody || normalizedExisting.endsWith(`\n\n${normalizedBody}`)) {
+    if (db && sessionID && typeof watermarkMs === "number") {
+      metaSet(db, `${APPEND_KEY_PREFIX}${pid}`, String(watermarkMs))
+    }
+    return true
+  }
   const merged = existing ? `${existing}\n\n${normalizedBody}` : normalizedBody
-  return writeMemoryFile(p, merged).ok
+  const written = writeMemoryFile(p, merged).ok
+  if (written && db && sessionID && typeof watermarkMs === "number") {
+    metaSet(db, `${APPEND_KEY_PREFIX}${pid}`, String(watermarkMs))
+  }
+  return written
 }
 
 function orphanFile(root: string): string {
