@@ -16,6 +16,7 @@ const SHARED_REL = [
   "memory/paths.ts",
   "memory/service.ts",
   "memory/storage.ts",
+  "memory/template.ts",
   "session/compaction-hook.ts",
   "session/retention.ts",
   "session/validator.ts",

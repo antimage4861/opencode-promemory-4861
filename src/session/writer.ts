@@ -2,6 +2,7 @@ import fs from "fs"
 import path from "path"
 import { buildPath, resolveProjectId } from "../memory/paths.ts"
 import { writeMemoryFile, readMemoryFile, withFileLock } from "../memory/storage.ts"
+import { ensureMemoryTemplate } from "../memory/template.ts"
 import { validateCheckpoint } from "./validator.ts"
 import type { Db } from "../memory/db.ts"
 import { metaGet, metaSet } from "../memory/fts.ts"
@@ -46,6 +47,21 @@ export function lastCheckpointMs(db: Db, sessionID: string): number {
   const raw = metaGet(db, `${CP_KEY_PREFIX}${sessionID}`)
   const n = raw ? Number(raw) : NaN
   return Number.isFinite(n) ? n : 0
+}
+
+/**
+ * Failure reporting for the writer pipeline. Every write/validate failure used
+ * to be silent: the caller discarded return values, so a rejected or
+ * unwritable checkpoint simply vanished. Logging goes through the opencode app
+ * log API (falls back to nothing if the SDK shape differs) — a logger must
+ * never itself break the write path.
+ */
+function reportFailure(deps: WriterDeps, level: "warn" | "error", message: string): void {
+  try {
+    void deps.client?.app?.log?.({ body: { service: "project-memory", level, message } })
+  } catch {
+    void 0
+  }
 }
 
 export function markCheckpoint(db: Db, sessionID: string, ms = Date.now()) {
@@ -173,10 +189,50 @@ async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childS
     }
     const checkpointFile = checkpointPath(deps.root, target.sessionID)
     const body = result.endsWith("CHECKPOINT_DONE") ? result.replace(/CHECKPOINT_DONE\s*$/, "").trim() : result
-    if (validateCheckpoint(body).ok) {
-      writeMemoryFile(checkpointFile, body)
+    const verdict = validateCheckpoint(body)
+    if (!verdict.ok) {
+      reportFailure(
+        deps,
+        "error",
+        `checkpoint rejected session=${target.sessionID} errors=${JSON.stringify(verdict.errors)}`,
+      )
+      await removeOrphan(deps.root, childSessionID)
+      return true
+    }
+    for (const w of verdict.warnings) {
+      reportFailure(deps, "warn", `checkpoint section budget session=${target.sessionID} ${w}`)
+    }
+
+    // Write both files before touching the watermark. Advancing the watermark
+    // mid-sequence used to lose the project-memory append permanently: the
+    // increment is never re-read once the watermark moves past it. Only advance
+    // when every write landed, so a failure is retried on the next trigger.
+    const checkpointWrite = writeMemoryFile(checkpointFile, body)
+    if (!checkpointWrite.ok) {
+      reportFailure(
+        deps,
+        "error",
+        `checkpoint write failed session=${target.sessionID} path=${checkpointFile} reason=${checkpointWrite.reason}`,
+      )
+    }
+    const projectWrite = target.projectDir
+      ? appendProjectMemory(deps.root, target.projectDir, body)
+      : true
+    if (!projectWrite) {
+      reportFailure(
+        deps,
+        "error",
+        `project memory append failed session=${target.sessionID} dir=${target.projectDir}`,
+      )
+    }
+    if (checkpointWrite.ok && projectWrite) {
       markCheckpoint(deps.db, target.sessionID)
-      appendProjectMemory(deps.root, target.projectDir, body)
+    } else {
+      reportFailure(
+        deps,
+        "error",
+        `watermark not advanced session=${target.sessionID}; next trigger will retry this increment`,
+      )
     }
     await removeOrphan(deps.root, childSessionID)
   } catch (e) {
@@ -245,6 +301,7 @@ export function appendProjectMemory(root: string, projectDir: string | undefined
   if (!projectDir) return false
   const normalizedBody = body.trim()
   if (!normalizedBody) return false
+  ensureMemoryTemplate(root, projectDir)
   const pid = resolveProjectId(projectDir)
   const p = buildPath({ root, scope: "projects", scope_id: pid, key: "MEMORY" })
   const existing = readMemoryFile(p) ?? ""
