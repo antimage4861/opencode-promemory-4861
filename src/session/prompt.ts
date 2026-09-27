@@ -36,16 +36,29 @@ Date: <ISO date>
 6. Keep it compact: each bullet at most 2 lines.
 7. Do NOT call any tool to write files or edit memory. The checkpoint and project memory (projects/MEMORY.md) are persisted by the host system from YOUR REPLY TEXT alone. Reply with the distilled markdown only.
 8. After the six sections, append a project-memory delta block. The host merges it into the four sections of projects/MEMORY.md; it decides nothing itself.
-   - Emit it as the last thing before CHECKPOINT_DONE, exactly this shape, one line, no code fence:
-     <!-- project-memory-delta {"Project context":"…","Rules":"…","Architecture decisions":"…","Discovered durable knowledge":"…","global":"…"} -->
-   - The four named keys are this project's sections. Use these four keys verbatim, each with a bullet list. One bullet per line: never put several \`- \` markers on the same line. If a section has nothing new, use an empty string rather than prose.
+   - Emit it as the last thing before CHECKPOINT_DONE, delimited exactly like this (the opening comment, then markdown sections, then the closing comment):
+     <!-- project-memory-delta
+     ## Project context
+     - one bullet per line
+     ## Rules
+     - one bullet per line
+     ## Architecture decisions
+     - one bullet per line
+     ## Discovered durable knowledge
+     - one bullet per line
+     ## Global (cross-project facts)
+     - one bullet per line
+     -->
+   - Use exactly these five headings, spelled as written. Omit any section that has nothing new — do not write "（无）" and do not leave a heading with an empty body.
+   - One bullet per line. Never put several bullets on the same line.
+   - Write paths, commands and identifiers verbatim. Do NOT escape backslashes, quotes or any other character — this is markdown, not JSON. A Windows path is written exactly as you see it: D:\\RMANBAK\\opencode-promemory-4861
    - "Project context": what this project is, its layout and conventions — only when this increment establishes or corrects it.
    - "Rules": constraints the user imposed, "never do X" rules, required workflow order.
    - "Architecture decisions": choices made and rejected alternatives, with the reason. Prefer keeping a decision here over restating it in Facts.
    - "Discovered durable knowledge": hard-won facts that will bite again — platform behaviour, library limits, config semantics, gotchas.
-   - "global" is a flat bullet list of facts about the user and this machine that stay true in ANY project: platform quirks, missing CLI tools or network paths, the commands they habitually use. Test each candidate by asking "would this still be true if the user opened a different repository?" If no, it belongs in the four project sections instead.
-   - Never put cross-project standing rules or preferences in "global" — the user's AGENTS.md already carries those as instructions. "global" is for discovered facts, not for rules.
-   - Do NOT put file lists, command transcripts, per-session status or anything already obvious from the code in "global". That is what the checkpoint is for.
+   - "Global (cross-project facts)": facts about the user and this machine that stay true in ANY project: platform quirks, missing CLI tools or network paths, the commands they habitually use. Test each candidate by asking "would this still be true if the user opened a different repository?" If no, it belongs in the four project sections instead.
+   - Never put cross-project standing rules or preferences in the Global section — the user's AGENTS.md already carries those as instructions. It is for discovered facts, not for rules.
+   - Do NOT put file lists, command transcripts, per-session status or anything already obvious from the code in the Global section. That is what the checkpoint is for.
    - This block is optional. If the increment has nothing durable, omit it entirely.
 9. Do not explain the process in the reply; end with the single line CHECKPOINT_DONE.
 `

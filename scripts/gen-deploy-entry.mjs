@@ -68,12 +68,19 @@ const source = fs.readFileSync(SRC_ENTRY, "utf8")
 const { text, rewritten } = renderDeployEntry(source)
 
 // Safety net: every rewritten import must resolve inside the deploy tree. A new
-// shared module added to src/index.ts but forgotten in SHARED_REL would
-// otherwise produce an entry that fails to load only at runtime in production.
+// shared module added to src/index.ts but not yet synced would otherwise produce
+// an entry that fails to load only at runtime in production.
+const shared = fs.readFileSync(path.join(repoRoot, "scripts", "sync-deploy.mjs"), "utf8")
 const missing = rewritten.filter((rel) => !fs.existsSync(path.join(DEPLOY_SRC, rel)))
 if (missing.length > 0) {
   console.error(`✗ 入口引用了未同步到 deploy 的模块(${missing.length} 个):`)
-  for (const rel of missing) console.error(`    ${rel}  ← 需加入 scripts/sync-deploy.mjs 的 SHARED_REL`)
+  for (const rel of missing) {
+    // Two distinct causes, and telling them apart saves a confusing detour:
+    // either the module was never declared as shared, or it was declared and
+    // sync:deploy simply has not been run since.
+    const declared = shared.includes(`"${rel}"`)
+    console.error(`    ${rel}  ← ${declared ? "已在 SHARED_REL 中,先运行 npm run sync:deploy" : "需加入 scripts/sync-deploy.mjs 的 SHARED_REL"}`)
+  }
   process.exit(1)
 }
 

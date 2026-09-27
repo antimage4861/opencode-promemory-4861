@@ -3,7 +3,7 @@
 - **新增:`global/MEMORY.md` 跨项目环境与习惯事实**。此前 global 只在类型与检索层预留、没有任何写入方,永远是空的。
   - 边界:装**关于用户与这台机器、换个项目依然成立**的事实(平台怪癖、缺失的工具、习惯命令)。判据是"若用户打开另一个仓库,这条还成立吗";不成立就该进项目那四段。
   - **跨项目的硬性规范与偏好不放这里** —— 用户的 AGENTS.md 已作为指令承载它们。global 是被发现的事实,不是规则。
-  - 由 writer delta 块的第 5 个键 `global` 维护,与项目四段同一次结算;提示词给出上述判据。
+  - 由 writer delta 块的 `## Global (cross-project facts)` 段维护,与项目四段同一次结算;提示词给出上述判据。
   - 预算 6000 字节(取自 MiMoCode 的 `caps.global`),超限保留最新、裁掉头部并记 warn。预算足够小,一份被污染的 global 肉眼可辨。
   - 幂等走 `global_appended` 水位,失败重试不会重复追加。
   - 仅含 global 内容的结算不重写项目 MEMORY.md(但仍推进项目水位,否则该增量会被无限重新蒸馏)。
@@ -11,6 +11,14 @@
   - **上游 MiMoCode 的 global 是「read-only from the agent side, no auto-create」** —— 完全没有写入方,其价值靠注入实现。本插件不做注入,因此 global 只能被主动检索;这削弱了它的自动生效程度,是与上游的设计差异。
 - README 与 memory 工具描述同步:global 从「预留无写入端」改为「由 writer 维护」;`notes` / `free` 仍无写入端。
 - npm test 增至 27 个用例,新增覆盖:仅 global 内容的结算不碰项目文件、一次结算内项目与 global 各归各位、同一水位重放不重复、global 超预算裁剪保留最新。
+
+- **修复:delta 块从 JSON 改为 markdown 分节格式**。首次生产验证即失败:子代理输出的 JSON 里有 10 处非法转义,全部是 Windows 路径的单反斜杠(`D:\RMANBAK` 里的 `\R` 不是合法 JSON 转义),整个块解析失败。
+  - 根因不是模型偶发失误,而是格式选错:路径是本系统最高频的内容,而 Windows 路径放进 JSON 字符串要求每个反斜杠都转义成双写。子代理在同一块内有的地方转义了、有的没转,必然翻车。
+  - 改为 markdown 分节(`## Project context` / `## Rules` / `## Architecture decisions` / `## Discovered durable knowledge` / `## Global (cross-project facts)`),对内容零约束:反斜杠、直引号、箭头、空行全部原样保留。解析复用记忆文件本身已在用的分节逻辑。
+  - 提示词明确写了「this is markdown, not JSON」并给出 Windows 路径的正例。
+  - 块边界不再用 `indexOf("-->")`:内容里的箭头(如「迁移 --> 展开」)会截断块,改为只认整行等于 `-->`;模型把标记接在最后一行时仍兼容。
+  - 退回路径的告警措辞随之改为「delta block present but no recognised section heading」。
+  - npm test 增至 31 个用例,新增覆盖:反斜杠路径/引号/箭头/缩进续行原样解析、今天真实失败的那类内容可解析、不认识的标题被忽略而非整体失败、无有效内容时返回 null。
 
 # 0.5.0 (2026-09-27)
 

@@ -31,6 +31,12 @@ import {
 } from "./session/writer.ts"
 import { cleanupExpiredSessions } from "./session/retention.ts"
 import { createCompactionHandler } from "./session/compaction-hook.ts"
+import {
+  describeDreamDiff,
+  diffProjectMemory,
+  snapshotProjectMemory,
+  type DreamSnapshot,
+} from "./session/dream.ts"
 import { WRITER_PROMPT } from "./session/prompt.ts"
 import { resolveConfig, asMemoryPluginOptions, type MemoryPluginConfig } from "./config.ts"
 
@@ -56,6 +62,9 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
   const writerState = new Map<string, PendingWriter>()
   const settlingWriters = new Map<string, Promise<boolean>>()
   const finalizingWriters = new Map<string, Promise<boolean>>()
+  // Set when the dream gate admits a command, cleared once the agent's turn
+  // ends and the before/after comparison has been logged.
+  let pendingDream: DreamSnapshot | null = null
 
   const sessionPidCache = new Map<string, string>()
   const getProjectId = () => (directory ? resolveProjectId(directory) : null)
@@ -88,6 +97,25 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
     finalizing: finalizingWriters,
     projectDir: directory ?? undefined,
     maxWriterRetries: cfg.writerMaxRetries,
+  }
+
+  /** Compare the project memory against the pre-dream snapshot and log the outcome. */
+  function reportDreamIfDue(): void {
+    if (!pendingDream) return
+    const diff = diffProjectMemory(pendingDream, memoryRoot)
+    pendingDream = null
+    const message = diff
+      ? describeDreamDiff(diff)
+      : `dream 已受理但项目记忆不可读，无法核对：${pendingDreamPath()}`
+    try {
+      void client?.app?.log?.({ body: { service: "project-memory", level: "info", message } })
+    } catch {
+      void 0
+    }
+  }
+
+  function pendingDreamPath(): string {
+    return pendingDream?.path ?? "(未知)"
   }
 
   const sessionsProvider = async () => {
@@ -198,6 +226,11 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
         return
       }
       metaSet(db, rule.key, String(now))
+      // dream rewrites the project memory itself, so nothing would record what it
+      // changed. Snapshot now, compare once the agent's turn ends.
+      if (cmd === "mem-dream") {
+        pendingDream = snapshotProjectMemory(memoryRoot, directory)
+      }
     },
     event: async ({ event }) => {
       if (event.type === "session.idle") {
@@ -206,6 +239,7 @@ export const ProjectMemoryPlugin: Plugin = async ({ client, directory }, options
           await settleWriter(writerDeps, writerState, sid)
           expireWriters(writerDeps, writerState, cfg.writerTimeoutMs)
         }
+        reportDreamIfDue()
         return
       }
       if (event.type === "session.status") {

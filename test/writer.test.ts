@@ -4,7 +4,8 @@ import os from "node:os"
 import path from "node:path"
 import { resolveProjectId } from "../src/memory/paths.ts"
 import { projectMemoryTemplate } from "../src/memory/template.ts"
-import { GLOBAL_CAP, SECTION_CAPS, mergeGlobalMemory, migrateMemoryLayout, normalizeBullets } from "../src/memory/merge.ts"
+import { GLOBAL_CAP, SECTION_CAPS, extractDelta, mergeGlobalMemory, migrateMemoryLayout, normalizeBullets } from "../src/memory/merge.ts"
+import { describeDreamDiff, diffProjectMemory, snapshotProjectMemory } from "../src/session/dream.ts"
 import type { Db } from "../src/memory/db.ts"
 import {
   bumpWriterFail,
@@ -407,8 +408,10 @@ describe("writer retry cap", () => {
 })
 
 describe("sectioned project memory", () => {
-  const deltaLine = (obj: Record<string, string>) =>
-    `<!-- project-memory-delta ${JSON.stringify(obj)} -->`
+  const deltaLine = (obj: Record<string, string>) => {
+    const sections = Object.entries(obj).map(([k, v]) => `## ${k}\n${v}`).join("\n")
+    return `<!-- project-memory-delta\n${sections}\n-->`
+  }
 
   const fourKeys = {
     "Project context": "- 这是一个开源插件",
@@ -466,19 +469,19 @@ describe("sectioned project memory", () => {
     }
   })
 
-  test("falls back to append when the delta block is malformed", async () => {
+  test("falls back to append when the delta block has no recognised section", async () => {
     const root = tempRoot()
     const { db } = createDb()
     const projectDir = path.join(root, "project")
     const memoryPath = path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md")
-    const reply = `${checkpoint}\n\n<!-- project-memory-delta {不是合法 JSON} -->\nCHECKPOINT_DONE`
+    const reply = `${checkpoint}\n\n<!-- project-memory-delta\n## 完全不认识的标题\n- 内容\n-->\nCHECKPOINT_DONE`
     const { deps, logs } = createLoggedDeps(root, db, okMessages(reply))
     const target = createTarget(projectDir)
     try {
       await finalizeWriter(deps, target, "child-bad")
       const merged = fs.readFileSync(memoryPath, "utf8")
       expect(merged).toContain("并发 settle 回归测试")
-      expect(logs.some((l) => l.message.includes("unparseable, appending instead"))).toBe(true)
+      expect(logs.some((l) => l.message.includes("no recognised section heading"))).toBe(true)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
@@ -586,8 +589,10 @@ describe("bullet normalization", () => {
 })
 
 describe("global memory", () => {
-  const globalLine = (obj: Record<string, string>) =>
-    `<!-- project-memory-delta ${JSON.stringify(obj)} -->`
+  const globalLine = (obj: Record<string, string>) => {
+    const sections = Object.entries(obj).map(([k, v]) => `## ${k}\n${v}`).join("\n")
+    return `<!-- project-memory-delta\n${sections}\n-->`
+  }
 
   test("merges an environment fact into global and leaves the project file alone", async () => {
     const root = tempRoot()
@@ -595,7 +600,7 @@ describe("global memory", () => {
     const projectDir = path.join(root, "project")
     const globalPath = path.join(root, "global", "MEMORY.md")
     const projectPath = path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md")
-    const reply = `${checkpoint}\n\n${globalLine({ global: "- 本机没有 gh CLI，PR 只能网页创建" })}\nCHECKPOINT_DONE`
+    const reply = `${checkpoint}\n\n${globalLine({ "Global (cross-project facts)": "- 本机没有 gh CLI，PR 只能网页创建" })}\nCHECKPOINT_DONE`
     const { deps, logs } = createLoggedDeps(root, db, okMessages(reply))
     const target = createTarget(projectDir)
     try {
@@ -618,7 +623,7 @@ describe("global memory", () => {
     const projectDir = path.join(root, "project")
     const reply = `${checkpoint}\n\n${globalLine({
       "Architecture decisions": "- 本项目记忆不设体积上限",
-      global: "- PowerShell 处理中文引号会吞引号",
+      "Global (cross-project facts)": "- PowerShell 处理中文引号会吞引号",
     })}\nCHECKPOINT_DONE`
     const { deps } = createLoggedDeps(root, db, okMessages(reply))
     const target = createTarget(projectDir)
@@ -662,14 +667,14 @@ describe("global memory", () => {
     const root = tempRoot()
     const { db } = createDb()
     const fat = "- " + "惯".repeat(400)
-    let reply = `${checkpoint}\n\n${globalLine({ global: `${fat}\n- 最早的条目` })}\nCHECKPOINT_DONE`
+    let reply = `${checkpoint}\n\n${globalLine({ "Global (cross-project facts)": `${fat}\n- 最早的条目` })}\nCHECKPOINT_DONE`
     const { deps, logs } = createLoggedDeps(root, db, async () => ({
       data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: reply }] }],
     }))
     try {
       return (async () => {
         for (let i = 0; i < 6; i++) {
-          reply = `${checkpoint}\n\n${globalLine({ global: `${fat}\n- 第${i}轮新增` })}\nCHECKPOINT_DONE`
+          reply = `${checkpoint}\n\n${globalLine({ "Global (cross-project facts)": `${fat}\n- 第${i}轮新增` })}\nCHECKPOINT_DONE`
           await finalizeWriter(deps, { sessionID: `g-${i}`, projectDir: root, title: "t" }, `gc-${i}`)
         }
         const global = fs.readFileSync(path.join(root, "global", "MEMORY.md"), "utf8")
@@ -682,3 +687,120 @@ describe("global memory", () => {
   })
 })
 
+
+describe("delta block content tolerance", () => {
+  test("parses Windows paths, quotes and arrows verbatim", () => {
+    const block = [
+      "<!-- project-memory-delta",
+      "## Project context",
+      "- 本地目录 `D:\RMANBAK\opencode-promemory-4861`，生产目录 `D:\RMANBAK\.opencode\plugins`",
+      '- 标题里带引号："Project context" 与 \'single\' 都能留',
+      "- 箭头 --> 不是结束标记",
+      "## Global (cross-project facts)",
+      "- 临时目录 `C:\Users\ADMINI~1\AppData\Local\Temp`；换行后继续写",
+      "  - 缩进的续行也在同一段里",
+      "-->",
+    ].join("\n")
+    const got = extractDelta(block)
+    expect(got).not.toBeNull()
+    expect(got!.project["Project context"]).toContain("D:\RMANBAK\opencode-promemory-4861")
+    expect(got!.project["Project context"]).toContain('"Project context"')
+    expect(got!.project["Project context"]).toContain("箭头 --> 不是结束标记")
+    expect(got!.global).toContain("C:\Users\ADMINI~1\AppData\Local\Temp")
+    expect(got!.global).toContain("缩进的续行")
+  })
+
+  test("the real-world failure case: unescaped backslash paths used to break JSON", () => {
+    // This is the exact content that failed in production: a JSON block where
+    // some Windows paths were written with single backslashes, making \R an
+    // illegal escape and failing the whole parse. The markdown format has no
+    // escaping requirement, so the same content now parses.
+    const block = [
+      "<!-- project-memory-delta",
+      "## Project context",
+      "- 本地目录 `D:\RMANBAK`，另一处写成 D:\cygwin\home\Administrator",
+      '## Discovered durable knowledge',
+      "- 结论: 前面有冒号也不影响解析",
+      "-->",
+    ].join("\n")
+    const got = extractDelta(block)
+    expect(got).not.toBeNull()
+    expect(got!.project["Project context"]).toContain("D:\RMANBAK")
+    expect(got!.project["Discovered durable knowledge"]).toContain("冒号也不影响解析")
+  })
+
+  test("ignores unknown headings instead of failing the whole block", () => {
+    const block = [
+      "<!-- project-memory-delta",
+      "## 随便一个标题",
+      "- 不该被采纳",
+      "## Rules",
+      "- 这条应该被采纳",
+      "-->",
+    ].join("\n")
+    const got = extractDelta(block)
+    expect(got).not.toBeNull()
+    expect(got!.project.Rules).toBe("- 这条应该被采纳")
+    expect(JSON.stringify(got)).not.toContain("不该被采纳")
+  })
+
+  test("returns null when no recognised heading carries content", () => {
+    expect(extractDelta("<!-- project-memory-delta\n## 空的\n-->\n")).toBeNull()
+    expect(extractDelta("没有 delta 块")).toBeNull()
+  })
+})
+
+describe("dream verification", () => {
+  const memoryOf = (root: string, projectDir: string) =>
+    path.join(root, "projects", resolveProjectId(projectDir), "MEMORY.md")
+
+  test("reports a revision: lines removed and added are both counted", () => {
+    const root = tempRoot()
+    const projectDir = path.join(root, "project")
+    const p = memoryOf(root, projectDir)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, ["## Rules", "- 旧事实：格式是 JSON", "- 保留事实", ""].join("\n"), "utf8")
+    const snap = snapshotProjectMemory(root, projectDir)
+    expect(snap).not.toBeNull()
+    // dream 修订：删掉过时那条，改写另一条，再加一条新的
+    fs.writeFileSync(p, ["## Rules", "- 保留事实", "- 新事实：格式是 markdown", ""].join("\n"), "utf8")
+    const diff = diffProjectMemory(snap, root)!
+    expect(diff.changed).toBe(true)
+    expect(diff.removed).toBe(1)
+    expect(diff.added).toBe(1)
+    expect(diff.linesBefore).toBe(3)
+    expect(diff.linesAfter).toBe(3)
+    expect(describeDreamDiff(diff)).toContain("删 1 行 / 增 1 行")
+  })
+
+  test("flags an append-only run, which is not a revision", () => {
+    const root = tempRoot()
+    const projectDir = path.join(root, "project")
+    const p = memoryOf(root, projectDir)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, "## Rules\n- 既有事实\n", "utf8")
+    const snap = snapshotProjectMemory(root, projectDir)
+    fs.writeFileSync(p, "## Rules\n- 既有事实\n- 只有新增\n", "utf8")
+    const text = describeDreamDiff(diffProjectMemory(snap, root)!)
+    expect(text).toContain("只有新增没有删除")
+  })
+
+  test("flags a no-op run instead of reporting success", () => {
+    const root = tempRoot()
+    const projectDir = path.join(root, "project")
+    const p = memoryOf(root, projectDir)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, "## Rules\n- 既有事实\n", "utf8")
+    const snap = snapshotProjectMemory(root, projectDir)
+    const text = describeDreamDiff(diffProjectMemory(snap, root)!)
+    expect(text).toContain("未改动项目记忆")
+    expect(text).toContain("说明它没有生效")
+  })
+
+  test("returns null when there is no project memory to snapshot", () => {
+    const root = tempRoot()
+    expect(snapshotProjectMemory(root, path.join(root, "nope"))).toBeNull()
+    expect(snapshotProjectMemory(root, undefined)).toBeNull()
+    expect(diffProjectMemory(null, tempRoot())).toBeNull()
+  })
+})
