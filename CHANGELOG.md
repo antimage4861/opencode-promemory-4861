@@ -1,3 +1,17 @@
+# 0.6.0 (2026-09-27)
+
+- **新增:`global/MEMORY.md` 跨项目环境与习惯事实**。此前 global 只在类型与检索层预留、没有任何写入方,永远是空的。
+  - 边界:装**关于用户与这台机器、换个项目依然成立**的事实(平台怪癖、缺失的工具、习惯命令)。判据是"若用户打开另一个仓库,这条还成立吗";不成立就该进项目那四段。
+  - **跨项目的硬性规范与偏好不放这里** —— 用户的 AGENTS.md 已作为指令承载它们。global 是被发现的事实,不是规则。
+  - 由 writer delta 块的第 5 个键 `global` 维护,与项目四段同一次结算;提示词给出上述判据。
+  - 预算 6000 字节(取自 MiMoCode 的 `caps.global`),超限保留最新、裁掉头部并记 warn。预算足够小,一份被污染的 global 肉眼可辨。
+  - 幂等走 `global_appended` 水位,失败重试不会重复追加。
+  - 仅含 global 内容的结算不重写项目 MEMORY.md(但仍推进项目水位,否则该增量会被无限重新蒸馏)。
+  - 存储、索引、检索三层零改动:`buildPath` / `parsePath` / `locKey` 对 global 早已支持,已验证往返正确;`memory` 工具 `scope=global` 直接可用。
+  - **上游 MiMoCode 的 global 是「read-only from the agent side, no auto-create」** —— 完全没有写入方,其价值靠注入实现。本插件不做注入,因此 global 只能被主动检索;这削弱了它的自动生效程度,是与上游的设计差异。
+- README 与 memory 工具描述同步:global 从「预留无写入端」改为「由 writer 维护」;`notes` / `free` 仍无写入端。
+- npm test 增至 27 个用例,新增覆盖:仅 global 内容的结算不碰项目文件、一次结算内项目与 global 各归各位、同一水位重放不重复、global 超预算裁剪保留最新。
+
 # 0.5.0 (2026-09-27)
 
 - **BREAKING:项目记忆改为分段结构化写入**。此前 writer 把每份 checkpoint 原文整份追加进 `projects/<pid>/MEMORY.md`,使该文件变成变更日志:无界增长、同一结论被反复重述、BM25 相关度被过程性内容(文件清单、命令流水)稀释,而真正值得进项目记忆的结论被埋在下面。
