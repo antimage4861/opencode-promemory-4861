@@ -37,12 +37,13 @@
   "scripts": {
     "build": "npm run gen:prompt && node scripts/build.mjs",
     "test": "bun test",
-    "check": "npm run gen:prompt -- --check && node scripts/publish-check.mjs",
+    "check": "npm run gen:prompt -- --check && npm run gen:deploy-entry -- --check && node scripts/publish-check.mjs",
     "pack": "npm run build && npm pack",
     "install:commands": "node scripts/install.mjs",
     "sync:deploy": "node scripts/sync-deploy.mjs",
     "release": "node scripts/github-release.mjs",
-    "gen:prompt": "node scripts/gen-prompt.mjs"
+    "gen:prompt": "node scripts/gen-prompt.mjs",
+    "gen:deploy-entry": "node scripts/gen-deploy-entry.mjs"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.9",
