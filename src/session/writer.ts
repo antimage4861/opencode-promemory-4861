@@ -22,8 +22,15 @@ import { validateCheckpoint } from "./validator.ts"
 import type { Db } from "../memory/db.ts"
 import { metaGet, metaSet } from "../memory/fts.ts"
 
-const INCREMENT_BUDGET = 24_000
+// Incremental input ceiling. The child session carries this verbatim inside
+// its own context, so exceeding it drives the host into compaction and the
+// writer ends up distilling an already-summarised increment. Measured: the
+// sub-agent's model reports 70% of its window as the compaction trigger,
+// which lands around 140K here. 135K leaves a small margin for the system
+// prompt and the wrapper text, which also count against the same budget.
+const INCREMENT_BUDGET = 135_000
 const WRITER_SYSTEM_BUDGET = 6_000
+const WRITER_DEADLINE_MS = 180_000
 const CP_KEY_PREFIX = "scanner:"
 const FAIL_KEY_PREFIX = "writer_fail:"
 const APPEND_KEY_PREFIX = "project_appended:"
@@ -154,6 +161,12 @@ export async function spawnWriter(deps: WriterDeps, target: WriterTarget, state:
   try {
     const inc = await readIncrement(deps, target)
     if (!inc.body.trim()) return
+    const incrementBytes = Buffer.byteLength(inc.body, "utf8")
+    reportFailure(
+      deps,
+      "warn",
+      `writer dispatch session=${target.sessionID} increment_bytes=${incrementBytes} budget=${INCREMENT_BUDGET} truncated=${inc.full === false} deadline_ms=${childDeadlineMs(incrementBytes)}`,
+    )
     const system = `${deps.writerPrompt.slice(0, WRITER_SYSTEM_BUDGET)}\n\n父会话 ID: ${target.sessionID}`
     const createBody: { parentID?: string; title?: string } = { title: target.title }
     if (target.parentID) createBody.parentID = target.parentID
@@ -178,17 +191,55 @@ export async function spawnWriter(deps: WriterDeps, target: WriterTarget, state:
       body: promptBody,
     })
     await persistOrphan(deps.root, target, childSessionID)
-    void watchChildCompletion(deps, state, childSessionID)
+    void watchChildCompletion(deps, state, childSessionID, incrementBytes)
   } catch (e) {
     state.delete(target.sessionID)
   }
 }
 
-async function watchChildCompletion(deps: WriterDeps, state: Map<string, PendingWriter>, childSessionID: string): Promise<void> {
-  const deadline = Date.now() + 180_000
+/**
+ * Deadline for a child's completion poll, scaled to the size of the increment it
+ * was handed and then padded.
+ *
+ * The original flat 180s was measured when increments were capped at 24KB. At
+ * the current 135K budget a 132,497-byte increment took 208s to distil, so the
+ * old ceiling cut the poll off 28 seconds before the child finished writing.
+ * The result read as an empty reply, which the caller correctly reports as
+ * "produced no output" — a wasted child and a burned retry.
+ *
+ * Measured: 208s at 132,497 bytes ≈ 1.57ms/byte. A 60s floor covers the
+ * fixed costs (session create, prompt round-trip, the child's own first
+ * token) so small increments are not penalised. The 1.5 factor is deliberate
+ * slack: distillation time is not linear in input, and a slow provider should
+ * cost a long wait, never a silent failure. A child that overruns this budget
+ * is still settled rather than abandoned, so the retry cap can see it.
+ */
+const CHILD_DEADLINE_BASE_MS = 60_000
+const CHILD_DEADLINE_MS_PER_BYTE = 2
+const CHILD_DEADLINE_SLACK = 1.5
+
+export function childDeadlineMs(incrementBytes: number): number {
+  const scaled = CHILD_DEADLINE_BASE_MS + incrementBytes * CHILD_DEADLINE_MS_PER_BYTE
+  return Math.round(Math.max(WRITER_DEADLINE_MS, scaled * CHILD_DEADLINE_SLACK))
+}
+
+async function watchChildCompletion(
+  deps: WriterDeps,
+  state: Map<string, PendingWriter>,
+  childSessionID: string,
+  incrementBytes: number,
+): Promise<void> {
+  const budget = childDeadlineMs(incrementBytes)
+  const startedAt = Date.now()
+  const deadline = startedAt + budget
   for (;;) {
     await new Promise((r) => setTimeout(r, 5_000))
     if (Date.now() > deadline) {
+      reportFailure(
+        deps,
+        "warn",
+        `writer child deadline reached child=${childSessionID} increment_bytes=${incrementBytes} budget_ms=${budget} elapsed_ms=${Date.now() - startedAt}`,
+      )
       await settleWriter(deps, state, childSessionID)
       return
     }
