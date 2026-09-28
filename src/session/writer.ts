@@ -31,6 +31,10 @@ import { metaGet, metaSet } from "../memory/fts.ts"
 const INCREMENT_BUDGET = 135_000
 const WRITER_SYSTEM_BUDGET = 6_000
 const WRITER_DEADLINE_MS = 180_000
+// Defined in .opencode/agent/promem-writer.md. Naming it here keeps the two in
+// sync: without a matching definition the host falls back to a default agent
+// that carries tools and can block waiting on an approval nobody is watching.
+const WRITER_AGENT = "promem-writer"
 const CP_KEY_PREFIX = "scanner:"
 const FAIL_KEY_PREFIX = "writer_fail:"
 const APPEND_KEY_PREFIX = "project_appended:"
@@ -168,7 +172,20 @@ export async function spawnWriter(deps: WriterDeps, target: WriterTarget, state:
       `writer dispatch session=${target.sessionID} increment_bytes=${incrementBytes} budget=${INCREMENT_BUDGET} truncated=${inc.full === false} deadline_ms=${childDeadlineMs(incrementBytes)}`,
     )
     const system = `${deps.writerPrompt.slice(0, WRITER_SYSTEM_BUDGET)}\n\n父会话 ID: ${target.sessionID}`
-    const createBody: { parentID?: string; title?: string } = { title: target.title }
+    // parentID is load-bearing, not bookkeeping. Without it the host's ask
+    // router has no parent to inherit grants from and falls back to interactive
+    // approval — the child then sits on a prompt nobody sees until the hard
+    // deadline fires, having done no work at all.
+    //
+    // The agent matters for the same reason: the default agent carries a full
+    // tool set, and the writer prompt's "do not call any tool" is a request,
+    // not a restriction. A 132K child that reached for bash burned the whole
+    // budget on an approval prompt instead of distilling.
+    const createBody: { parentID?: string; title?: string; agent?: string } = {
+      title: target.title,
+      parentID: target.parentID ?? target.sessionID,
+      agent: WRITER_AGENT,
+    }
     if (target.parentID) createBody.parentID = target.parentID
     const createdRes = await deps.client.session.create({ body: createBody })
     childSessionID = createdRes?.data?.id ?? createdRes?.id
