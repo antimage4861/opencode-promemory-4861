@@ -19,6 +19,7 @@ import {
   finalizeWriter,
   persistOrphan,
   settleWriter,
+  childDeadlineMs,
   type PendingWriter,
   type WriterDeps,
   type WriterTarget,
@@ -300,6 +301,29 @@ describe("watermark monotonicity", () => {
     expect(lastCheckpointMs(db, "s1")).toBe(2000)
     expect(markCheckpoint(db, "s1", 3000)).toBe(true)
     expect(lastCheckpointMs(db, "s1")).toBe(3000)
+  })
+})
+
+describe("child deadline scaling", () => {
+  // Measured: a 132,497-byte increment took 208s to distil, and the flat 180s
+  // ceiling cut the poll off before the child finished writing — which the
+  // caller then reports as "produced no output".
+  test("scales past the measured 208s at 132KB", () => {
+    expect(childDeadlineMs(132_497)).toBeGreaterThan(208_000)
+  })
+
+  test("never drops below the original flat ceiling for small increments", () => {
+    expect(childDeadlineMs(0)).toBe(180_000)
+    expect(childDeadlineMs(24_000)).toBe(180_000)
+  })
+
+  test("grows monotonically with the increment", () => {
+    let previous = 0
+    for (const bytes of [0, 24_000, 60_000, 100_000, 135_000]) {
+      const budget = childDeadlineMs(bytes)
+      expect(budget).toBeGreaterThanOrEqual(previous)
+      previous = budget
+    }
   })
 })
 
