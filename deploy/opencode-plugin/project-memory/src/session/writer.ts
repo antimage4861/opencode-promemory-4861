@@ -218,21 +218,28 @@ export async function spawnWriter(deps: WriterDeps, target: WriterTarget, state:
  * Deadline for a child's completion poll, scaled to the size of the increment it
  * was handed and then padded.
  *
- * The original flat 180s was measured when increments were capped at 24KB. At
- * the current 135K budget a 132,497-byte increment took 208s to distil, so the
- * old ceiling cut the poll off 28 seconds before the child finished writing.
- * The result read as an empty reply, which the caller correctly reports as
- * "produced no output" — a wasted child and a burned retry.
+ * The original flat 180s was measured when increments were capped at 24KB, and
+ * stopped being meaningful once the budget rose to 135K. A 132,497-byte
+ * increment then took 490s to distil, so the old ceiling cut the poll off before
+ * the child finished writing. The result read as an empty reply, which the
+ * caller correctly reports as "produced no output" — a wasted child and a
+ * burned retry. With the retry cap at 3, a third failure silences the session
+ * for good, so under-budgeting is the expensive direction.
  *
- * Measured: 208s at 132,497 bytes ≈ 1.57ms/byte. A 60s floor covers the
- * fixed costs (session create, prompt round-trip, the child's own first
- * token) so small increments are not penalised. The 1.5 factor is deliberate
- * slack: distillation time is not linear in input, and a slow provider should
- * cost a long wait, never a silent failure. A child that overruns this budget
- * is still settled rather than abandoned, so the retry cap can see it.
+ * 4ms/byte is set from a completed run: 490s ÷ 132,497B ≈ 3.7ms/byte. The 1.5
+ * factor on top gives ~6.7x headroom over the measured cost. Note the first
+ * attempt at this constant used 2ms, derived from a 208s reading that turned
+ * out to be the moment the 180s ceiling cut the poll — not a completion time.
+ * Re-measure against a real full-budget (135,000B) run if this ever looks tight
+ * again.
+ *
+ * The 60s base covers the fixed costs (session create, prompt round-trip, the
+ * child's first token) so small increments are not penalised, and the result
+ * never drops below the original 180s floor. A child that overruns the budget
+ * is still settled rather than abandoned, so the retry cap can observe it.
  */
 const CHILD_DEADLINE_BASE_MS = 60_000
-const CHILD_DEADLINE_MS_PER_BYTE = 2
+const CHILD_DEADLINE_MS_PER_BYTE = 4
 const CHILD_DEADLINE_SLACK = 1.5
 
 export function childDeadlineMs(incrementBytes: number): number {

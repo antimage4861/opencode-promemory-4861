@@ -305,16 +305,32 @@ describe("watermark monotonicity", () => {
 })
 
 describe("child deadline scaling", () => {
-  // Measured: a 132,497-byte increment took 208s to distil, and the flat 180s
-  // ceiling cut the poll off before the child finished writing — which the
-  // caller then reports as "produced no output".
-  test("scales past the measured 208s at 132KB", () => {
-    expect(childDeadlineMs(132_497)).toBeGreaterThan(208_000)
+  // Measured: a 132,497-byte increment took 490s to distil (a completed run).
+  // The budget must clear that with real margin, not by a hair — an earlier
+  // constant derived from 2ms/byte landed at 487s and passed only because the
+  // run came in 3s under. The third failure trips the retry cap and silences
+  // the session permanently, so under-budgeting is the expensive direction.
+  const MEASURED_BYTES = 132_497
+  const MEASURED_MS = 490_000
+
+  test("covers the measured 132KB run with margin", () => {
+    const budget = childDeadlineMs(MEASURED_BYTES)
+    expect(budget).toBeGreaterThan(MEASURED_MS)
+    // 1.25x is the floor we want: 2ms/byte satisfied ">" but left -2.5s of
+    // headroom in practice, which is not a margin at all.
+    expect(budget).toBeGreaterThanOrEqual(MEASURED_MS * 1.25)
   })
 
-  test("never drops below the original flat ceiling for small increments", () => {
+  test("never drops below the original flat ceiling", () => {
+    // The budget is a ceiling, not a wait: a small increment still settles as
+    // soon as the child reports idle. What must never happen is the budget
+    // falling under the old flat 180s, which would re-tighten the deadline the
+    // scaling exists to widen. Exact equality was the wrong assertion — at
+    // 4ms/byte a 24KB increment legitimately gets 234s.
+    for (const bytes of [0, 5_000, 12_000, 24_000]) {
+      expect(childDeadlineMs(bytes)).toBeGreaterThanOrEqual(180_000)
+    }
     expect(childDeadlineMs(0)).toBe(180_000)
-    expect(childDeadlineMs(24_000)).toBe(180_000)
   })
 
   test("grows monotonically with the increment", () => {
