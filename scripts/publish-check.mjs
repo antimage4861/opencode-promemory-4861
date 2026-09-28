@@ -33,6 +33,26 @@ for (const banned of ["node_modules", "src", ".git"]) {
 if (!pkg.license) problems.push("缺少 license")
 else ok.push(`license=${pkg.license}`)
 
+// The plugin names this agent in session.create(). If it is absent from the
+// tarball the host silently falls back to a default agent: the writer sub-agent
+// regains a full tool set and its permission asks become interactive again.
+// Both failures were observed before this file existed, so check it here rather
+// than letting them come back through a stale build.
+const agentFile = "dist/agent/promem-writer.md"
+if (!existsSync(new URL(agentFile, root))) {
+  problems.push(`缺少 ${agentFile} (请先 npm run build) — 缺失会导致 writer 子代理回退到默认 agent`)
+} else {
+  const body = await readF(new URL(agentFile, root), "utf8")
+  if (!/toolAllowlist|permission:/.test(body)) {
+    problems.push(`${agentFile} 缺少工具/权限限制,子代理将获得默认工具集`)
+  } else {
+    ok.push(agentFile)
+  }
+  if (!/mode:\s*subagent/.test(body)) {
+    problems.push(`${agentFile} 未声明 mode: subagent,审批将回退为交互式`)
+  }
+}
+
 if (problems.length > 0) {
   console.error("✗ 发布前检查未通过:")
   for (const p of problems) console.error(`  - ${p}`)
