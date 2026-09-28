@@ -53,6 +53,39 @@ if (!existsSync(new URL(agentFile, root))) {
   }
 }
 
+// dist/ is gitignored, so a source change does not invalidate it — the bundle
+// on disk can be arbitrarily older than src/. Publishing that bundle ships code
+// the repository no longer contains, and it is invisible: the local `npm pack`
+// shasum then matches the tarball, so nothing looks wrong. Observed after the
+// deadline-constant change, where pack happily produced the pre-change bundle
+// under a bumped version number.
+const srcWriter = await readF(new URL("src/session/writer.ts", root), "utf8").catch(() => "")
+const distBundle = await readF(new URL("dist/index.js", root), "utf8").catch(() => "")
+if (srcWriter && distBundle) {
+  // Compare only the load-bearing tuning constants. Both sides are normalised
+  // before comparing because the two write the same number differently:
+  // `135_000` in source, `135e3` in the bundle. Number() alone is not enough —
+  // it returns NaN for the underscore form, so NaN !== 135000 would report
+  // drift on a perfectly fresh build.
+  const num = (raw) => Number(String(raw).replace(/_/g, ""))
+  const TRACKED = ["CHILD_DEADLINE_MS_PER_BYTE", "INCREMENT_BUDGET"]
+  const stale = TRACKED.filter((name) => {
+    const inSrc = srcWriter.match(new RegExp(`^const[ \\t]+${name}[ \\t]*=[ \\t]*(-?[0-9_.e]+)`, "m"))?.[1]
+    const inDist = distBundle.match(new RegExp(`^var[ \\t]+${name}[ \\t]*=[ \\t]*(-?[0-9_.e]+)`, "m"))?.[1]
+    // Only a name declared on both sides is comparable: the bundle drops some
+    // consts entirely, and an absent one is not drift.
+    if (inSrc === undefined || inDist === undefined) return false
+    return num(inSrc) !== num(inDist)
+  })
+  if (stale.length > 0) {
+    problems.push(
+      `dist/index.js 与 src/session/writer.ts 不一致(${stale.join(", ")}) — 请先 npm run build,否则发布的是旧代码`,
+    )
+  } else {
+    ok.push("dist 与 src 常量一致")
+  }
+}
+
 if (problems.length > 0) {
   console.error("✗ 发布前检查未通过:")
   for (const p of problems) console.error(`  - ${p}`)
