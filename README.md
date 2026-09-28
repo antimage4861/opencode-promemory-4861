@@ -41,25 +41,32 @@ cp node_modules/opencode-promemory-4861/dist/index.js ~/.config/opencode/plugins
 
 ---
 
-## 安装交互式命令(可选但推荐)
+## 安装命令模板与 writer 子代理定义(推荐)
 
-插件注册两个自定义工具 `memory` / `history`,agent 可自主调用;[斜杠命令]依赖命令模板,需要额外一步(插件不自动注册命令):
+插件注册两个自定义工具 `memory` / `history`,agent 可自主调用;**斜杠命令**依赖命令模板,**writer 子代理定义**缺失会导致子代理回退到默认 agent,两者都需要额外一步(插件本身不自动注册):
 
 ```bash
-# 一键复制 4 个命令模板到全局 command 目录(~/.config/opencode/command/)
+# 一键复制命令模板到全局 command 目录 + writer 子代理定义到 agent 目录
 npx promem-install
 # 或
 npm i -g opencode-promemory-4861 && promem-install
 ```
 
-模板随 npm 包内的 `dist/command/*.md` 分发,脚本自动定位。手动复制亦可(模板在仓库 `dist/command/*.md`):
+脚本会安装到**所有**可能读取的位置(全局 + 从 cwd 向上找到的所有 `.opencode/command` 与 `.opencode/agent`),按内容比对而非 mtime 判新旧,装完交叉校验字节一致。
+
+手动复制亦可:
 
 ```
 mem-checkpoint.md  mem-dream.md  mem-distill.md  mem-search.md
 → 复制到 ~/.config/opencode/command/
+
+promem-writer.md
+→ 复制到 ~/.config/opencode/agent/
 ```
 
-卸载:删除该目录下上述 4 个文件即可。
+> **为什么 `promem-writer.md` 不是可选的。** 插件在 `session.create` 里指定这个子代理,宿主按名字查找定义。文件缺失时不会报错,而是回退到默认 agent —— 后果是子代理重新获得完整工具集(实测 132K 增量下发起 9 次 bash 调用),且其权限询问因找不到可继承授权的父会话而变成交互式,于是子代理在无人应答的界面空耗到硬超时。`npm run check` 会校验该文件存在于构建产物中。
+
+卸载:删除上述目录下的对应 `.md` 文件即可(卸载子代理定义会失去上述隔离)。
 
 ---
 
@@ -197,7 +204,8 @@ src/
 ├── history/                 # 历史镜像:FTS5 索引、检索、消息→parts 拆解
 ├── session/                 # 沉淀核心:writer(蒸馏/追加/占位)、compaction-hook、retention(过期清理)、validator、prompt(内联)
 ├── tools/                   # memory / history 工具定义
-└── command/                 # 4 个斜杠命令模板(随包分发)
+├── command/                 # 4 个斜杠命令模板(随包分发)
+└── agent/                   # writer 子代理定义(随包分发,必需)
 ```
 
 发布到 npm:
