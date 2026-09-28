@@ -1,3 +1,15 @@
+# 0.6.2 (2026-09-28)
+
+- **删除:`session.idle` / `session.status` 里两处无效的 `settleWriter` 调用**。`settleWriterOnce` 按 `p.childSessionID === childSessionID` 匹配在途 writer,而 `state` 的键是**父**会话 id、值里的 `childSessionID` 是**子**会话 id,`session.idle` 事件只带父会话 id —— 查找永远匹配不上,两条路径实际都是 no-op。
+  - 结算一直由 `watchChildCompletion` 的 5 秒轮询 + 180 秒硬超时承担,删除无功能损失。
+  - `expireWriters` 保留:它遍历整个 map、不依赖传入的 id,有效。
+  - `session.status` 分支整体删除后,idle 分支仍保留 dream 事后核对(`reportDreamIfDue`)—— 那条依赖的是事件本身而非参数,有效。
+  - 风险在认知层面:这段代码让人误以为 idle 是结算主路径。README 原文「触发通道有两个」是对的,误读来自未区分**派发**(`runWriter`,2 处)与**结算**(`settleWriter`,6 处)。
+- **文档:新增 `docs/ARCHITECTURE.md`**(477 行),并修正 README 三处与代码不符:
+  - 重点展开 checkpoint 的两条触发路径。压缩前触发**不只是抢救原文**,更关键的是保护蒸馏输入的保真度 —— writer 提示词要求 Facts 段逐字保留精确值,而 `readIncrement` 从 `session.messages()` 重新拉取;压缩后那段历史已被摘要改写,此时蒸馏等于拿二手摘要当输入,精确值在摘要那一步就丢了,再蒸馏只是把丢失固化。
+  - 结算机制:完成检测靠轮询,不依赖任何事件。
+  - README 补上漏列的三个配置项,其中 `WRITER_MAX_RETRIES` 关键(它在**派发前**检查,防止磁盘满这类永久故障每次触发都烧一个子会话);澄清 10KB 是拒绝线、section 预算是警告线(分开是刻意的:被拒的 checkpoint 会静默丢失);「追加项目 MEMORY.md」更正为「按 delta 块分节合并」。
+
 # 0.6.1 (2026-09-28)
 
 - **修复:delta 块从 JSON 改为 markdown 分节格式**。0.6.0 的 global 写入路径首次生产验证即失败:子代理输出的 JSON 里有 10 处非法转义,全部是 Windows 路径的单反斜杠 —— `D:\RMANBAK` 里的 `\R` 不是合法 JSON 转义,整个块解析失败,宿主退回追加路径,项目 MEMORY.md 混进一整份原始 checkpoint(已清理),global 一条没写。

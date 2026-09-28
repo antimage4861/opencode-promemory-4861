@@ -4,6 +4,8 @@ OpenCode 项目记忆插件:跨会话自动沉淀 checkpoint、BM25(FTS5)检索�
 
 面向"记忆会丢、跨会话上下文断裂"的痛点:把散落在多个会话里的稳定结论、决策、精确值自动提炼成结构化记忆,并在未来会话中可全文检索。
 
+> **想改这个插件?** 看 [架构说明](docs/ARCHITECTURE.md) —— 三层结构、checkpoint 两条触发路径、writer 生命周期的九道关口与三条不变量、同步防漂移机制。
+
 - 运行时:Bun(opencode 自带)。`bun:sqlite` 为内建依赖,无需额外安装。
 - 依赖:零运行时第三方包(单文件 bundle,external 仅 `bun:sqlite` 与 `@opencode-ai/plugin`)。
 - 语言:记忆内容与命令输出均为中文。
@@ -72,10 +74,29 @@ mem-checkpoint.md  mem-dream.md  mem-distill.md  mem-search.md
 | `/mem-distill` | 工作流提炼:识别近一月可复用的人工流程,沉淀为 skill/agent/command。默认 30 天一次 |
 | `/mem-search <词>` | 一次调用同时搜 memory 与 history |
 
+### checkpoint 的两条触发路径
+
+checkpoint(把会话增量蒸馏为结构化记忆)只有两个派发点:
+
+| 路径 | 触发 | 何时 |
+| --- | --- | --- |
+| **压缩前自动沉淀** | `experimental.session.compacting` 事件 | 会话上下文将满、被摘要改写之前 |
+| **手动 checkpoint** | `/mem-checkpoint` | 随时 |
+
+压缩前触发**不只是为了抢救原文**,更关键的是保护**蒸馏输入的保真度**:writer 提示词
+要求 Facts 段逐字保留精确值(端口、路径、完整命令),而 `readIncrement` 是从
+`session.messages()` 重新拉取的。压缩后那段历史已被摘要改写,此时再蒸馏,蒸馏对象
+就从原始推理过程变成了二手摘要——精确值在摘要那一步就丢了,再蒸馏只是把丢失固化。
+
+其余理由:压缩是宿主明确告知的边界(唯一「重写前」信号,`session.idle` 顺序上永远更晚);
+水位是时间戳、增量按 `created > since` 选取,压缩前结算面对的是稳定的消息列表。
+
+两条路径的完整流程、去重闸门与结算机制见 [架构说明 · checkpoint 的两条触发路径](docs/ARCHITECTURE.md#2-checkpoint-的两条触发路径)。
+
 自动行为(事件驱动,无需操作):
 
-- **压缩前沉淀**:会话 compaction 前若有未沉淀增量,自动先沉淀。
-- **孤儿接管**:若某次蒸馏/整合子会话中途退出,留空的 checkpoint 由下个会话启动时自动补齐、写入并清理。
+- **压缩前沉淀**:见上表路径 A。
+- **孤儿接管**:若某次蒸馏子会话中途退出(进程崩溃/被杀),在途状态记于 `.writers.json`,由下个会话启动时自动补齐、写入并清理。
 
 ---
 
@@ -86,10 +107,13 @@ mem-checkpoint.md  mem-dream.md  mem-distill.md  mem-search.md
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `PROJECT_MEMORY_DISABLE_WRITE` | `false` | 设为 `true` 只读:关闭所有写入(自动沉淀/整合/命令全停,仅保留检索) |
-| `PROJECT_MEMORY_WRITER_TIMEOUT_MS` | `120000` | 子会话蒸馏超时 |
+| `PROJECT_MEMORY_WRITER_TIMEOUT_MS` | `120000` | 子会话蒸馏超时(轮询 180 秒硬超时后强制结算,达到此值清理在途状态与孤儿) |
+| `PROJECT_MEMORY_WRITER_MAX_RETRIES` | `3` | 同一会话连续失败上限。**在派发前检查**,磁盘满/只读挂载这类永久故障否则每次触发都烧一个子会话 |
 | `PROJECT_MEMORY_RETENTION_DAYS` | `0` | 会话 checkpoint 保留天数,`0` = 不清理 |
+| `PROJECT_MEMORY_RETENTION_CLEANUP_INTERVAL_DAYS` | `1` | 过期清理的检查间隔天数 |
 | `PROJECT_MEMORY_RECONCILE_ON_SEARCH` | `true` | 检索前是否重建文件索引 |
 | `PROJECT_MEMORY_SEARCH_SCORE_FLOOR` | `0.15` | BM25 分数阈值(相对最佳命中的比例) |
+| `PROJECT_MEMORY_VALIDATOR_FULL` | `false` | 是否启用完整校验 |
 | `PROJECT_MEMORY_DREAM_INTERVAL_DAYS` | `7` | dream 间隔天数 |
 | `PROJECT_MEMORY_DISTILL_INTERVAL_DAYS` | `30` | distill 间隔天数 |
 
@@ -121,13 +145,22 @@ memory/
 
 ## 架构(精炼设计说明)
 
+> 完整版见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。以下是压缩摘要。
+
 三层结构,各司其职:
 
 **1. 采集层(base:历史镜像)**
 `message.updated` 事件把每次完整消息的文本 parts 写入 `history.db` 的 `history_fts` 表格,配 `history_fts_idx` 虚拟表做 FTS5 索引;写入时带 `project_id`(会话所属项目目录的 sha256 pid,经内存缓存 + 懒查 `session.get` 定位);`message.removed`/`session.deleted` 同步删除。启动时 `catchupHistory` 补偿补拉历史消息,并对存量数据 `backfillProjectIds` 回填 `project_id`(已删除会话无法回填的标 NULL)。中文分词靠 `cjkSpace()`:在连续汉字间插空格,配合 FTS5 按空格分词,实现中文 BM25 近似检索。
 
 **2. 沉淀层(writer:值蒸馏)**
-核心是 `runWriter` → `settleWriter`:为一个会话挑选上次 checkpoint 之后的增量消息,拼接蒸馏提示词(`writer-prompt`,已内联在 bundle 中)派发**子会话**执行,子会话**不暴露任何工具**(只依赖增量原文,防止检索到其他项目内容污染本项目记忆)、被强制输出结构化 markdown(checkpoint 格式,含 Summary/Decisions/Facts/Open/Files/Notes)。宿主侧校验结果(必含各 section、≤10KB、防空白过多/垃圾文本),通过后写入 `sessions/<id>/checkpoint.md` 并**追加**项目 `MEMORY.md`,同时记录 `scanner:<sid>` 水位。触发通道有两个:压缩前 / 手动命令。若子会话中途退出,写 `.writers.json` 留下孤儿记录,下次启动由 `settleStartupOrphans` 接管补齐(只跳过 status 为 busy/retry 的仍在运行会话)。
+核心是 `runWriter` → `settleWriter`:为一个会话挑选上次 checkpoint 之后的增量消息,拼接蒸馏提示词(`writer-prompt`,已内联在 bundle 中)派发**子会话**执行,子会话**不暴露任何工具**(只依赖增量原文,防止检索到其他项目内容污染本项目记忆)、被强制输出结构化 markdown(checkpoint 格式,含 Summary/Decisions/Facts/Open/Files/Notes)。通过后写入 `sessions/<id>/checkpoint.md`,并按 delta 块分节合并进项目 `MEMORY.md`,同时记录 `scanner:<sid>` 水位。派发通道有两个(压缩前 / 手动命令),详见上文「checkpoint 的两条触发路径」;结算不依赖事件,由 5 秒轮询子会话状态 + 180 秒硬超时完成。若子会话中途退出,写 `.writers.json` 留下孤儿记录,下次启动由 `settleStartupOrphans` 接管补齐(只跳过 status 为 busy/retry 的仍在运行会话)。
+
+**校验分两层,这是刻意区分**:
+
+- **拒绝**:缺 7 个必需 section 之一 / 超 10KB / 空白行占比 > 50% / 命中垃圾模式
+- **警告**:单个 section 超预算(800–2000 字节不等),只记日志不拒绝
+
+理由:被拒绝的 checkpoint 会**静默丢失**,而让丢弃可见正是这套校验存在的意义。段落预算总和 7400 字节落在 10KB 之内,超预算时通常先撞总大小错误,便于定位真实原因。
 
 **3. 检索层(tools:BM25)**
 `memory` / `history` 两个自定义工具,统一走 FTS5 `bm25()` 排序、`scoreFloor` 相对阈值过滤、`extractSnippet` 按命中关键词切片做上下文片段。返回片段的定位(path / session_id / part_id)让 agent 能用 `read` 或 `history get` 取全文。
