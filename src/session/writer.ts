@@ -290,20 +290,36 @@ export async function spawnWriter(deps: WriterDeps, target: WriterTarget, state:
  * burned retry. With the retry cap at 3, a third failure silences the session
  * for good, so under-budgeting is the expensive direction.
  *
- * 4ms/byte is set from a completed run: 490s ÷ 132,497B ≈ 3.7ms/byte. The 1.5
- * factor on top gives ~6.7x headroom over the measured cost. Note the first
- * attempt at this constant used 2ms, derived from a 208s reading that turned
- * out to be the moment the 180s ceiling cut the poll — not a completion time.
- * Re-measure against a real full-budget (135,000B) run if this ever looks tight
- * again.
+ * 6ms/byte is fitted from four full-budget runs against a live provider:
  *
- * The 60s base covers the fixed costs (session create, prompt round-trip, the
- * child's first token) so small increments are not penalised, and the result
- * never drops below the original 180s floor. A child that overruns the budget
- * is still settled rather than abandoned, so the retry cap can observe it.
+ *   135,082 B → 902.9 s      28,307 B → 260.9 s
+ *   133,539 B → 892.5 s       47,253 B → 375.7 s
+ *
+ * Least squares on the two extreme sizes gives 90.7s + 6.01 ms/byte, which the
+ * previous 4ms constant matched almost exactly: (60s + 4n) × 1.5 = 90s + 6.00n.
+ * That agreement is the problem, not the vindication. The 1.5 factor was never
+ * slack — the original 2ms value came from a 208s reading that was the moment
+ * the 180s ceiling cut the poll, so "slack" was budget × budget. Doubling the
+ * coefficient to 4 spent what little margin there was, leaving zero, and every
+ * one of the four runs finished 1.1–2.4s past its deadline.
+ *
+ * 6ms gives (60s + 6n) × 1.5 = 90s + 9n: about 45% over the measured 6.01 at full
+ * budget, and ~32% at 28KB where the fixed base carries more of the total. Small
+ * increments are already comfortable — the old floor was 180s and a 5KB batch
+ * needs under a minute.
+ *
+ * Those runs could be told apart from children that finished early only because
+ * the status probe runs before the deadline check and logs `status=busy`. Before
+ * that swap a completed-but-missed child and a genuinely cut-off one produced the
+ * identical line, so "every batch overran" was uninterpretable.
+ *
+ * The 60s base covers fixed costs (session create, prompt round-trip, the child's
+ * first token) and matches the fitted 90.7s intercept once the 1.5 applies. A
+ * child that overruns is still settled rather than abandoned, so the retry cap
+ * can observe it and the host loop can continue.
  */
 const CHILD_DEADLINE_BASE_MS = 60_000
-const CHILD_DEADLINE_MS_PER_BYTE = 4
+const CHILD_DEADLINE_MS_PER_BYTE = 6
 const CHILD_DEADLINE_SLACK = 1.5
 
 export function childDeadlineMs(incrementBytes: number): number {
