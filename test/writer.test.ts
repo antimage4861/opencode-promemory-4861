@@ -11,8 +11,9 @@ import {
   bumpWriterFail,
   clearWriterFail,
   writerFailCount,
-  markCheckpoint,
-  lastCheckpointMs,
+    markCheckpoint,
+    lastCheckpointMs,
+    lastCheckpointId,
   runWriter,
   appendProjectMemory,
   checkpointPath,
@@ -240,9 +241,12 @@ describe("writer failure visibility", () => {
     const { deps, logs } = createLoggedDeps(root, db, okMessages(fat))
     const target = createTarget(root)
     try {
-      await finalizeWriter(deps, target, "child-fat")
+      // A cursor, as every real batch carries. Settlement holds the watermark
+      // when none is supplied, so the assertion below needs one to mean
+      // anything — the test's subject is the section warning, not the cursor.
+      await finalizeWriter(deps, target, "child-fat", { lastConsumed: 1_700_000_000_000, lastConsumedId: "m1" })
       expect(fs.existsSync(checkpointPath(root, target.sessionID))).toBe(true)
-      expect(values.get(`scanner:${target.sessionID}`)).toBeDefined()
+      expect(values.get(`scanner:${target.sessionID}`)).toBe("1700000000000")
       const warns = logs.filter((l) => l.level === "warn")
       expect(warns.length).toBeGreaterThan(0)
       expect(warns.some((w) => w.message.includes("## Facts") && w.message.includes("budget"))).toBe(true)
@@ -345,17 +349,17 @@ describe("child deadline scaling", () => {
 })
 
 describe("increment overflow", () => {
-  // A known data-loss path, pinned before any fix lands.
+  // Regression cover for the data-loss path that used to sit here.
   //
   // readIncrement stops at INCREMENT_BUDGET and reports full=false, but
-  // finalisation advances the watermark to settleStart — the moment the child
-  // was dispatched, not the time of the last message actually read. Every
-  // message after the cut has a created timestamp below a watermark that jumped
-  // over it, so no later checkpoint can ever select it again. Nothing reports
-  // this: the only signal is one `truncated=true` warn line at dispatch.
+  // finalisation used to advance the watermark to settleStart — the dispatch
+  // time, not the last message actually read. Every message past the cut fell
+  // below a watermark that had jumped over it, so no later checkpoint could ever
+  // select it. Measured on a 240KB increment: 6 messages, 120,118 bytes, gone
+  // with no error reported.
   //
-  // These assert CURRENT behaviour deliberately. A fix for the host loop turns
-  // the last one red — that is the point of pinning it first.
+  // The cursor now tracks the last message handed over in full, and a truncated
+  // batch re-arms the writer for the next one.
   const CHUNK = "x".repeat(20_000)
   const BASE = 1_700_000_000_000
 
@@ -366,107 +370,254 @@ describe("increment overflow", () => {
     }))
   }
 
-  /** Spawn and capture the exact increment handed to the child. */
-  async function spawnAndCapture(
-    deps: WriterDeps,
-    target: WriterTarget,
-  ): Promise<{ fed: string; truncated: boolean }> {
-    let fed = ""
-    const state = new Map<string, PendingWriter>()
-    const capturing: WriterDeps = {
-      ...deps,
+  const childCheckpoint = async () => ({
+    data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: checkpoint }] }],
+  })
+
+  /** deps whose child dispatch records what was fed. */
+  function dispatchDeps(root: string, db: Db, messages: unknown[], fed: { value: string }): WriterDeps {
+    return {
+      ...createDeps(root, db, async () => ({ data: messages })),
       client: {
         session: {
-          messages: deps.client.session.messages,
+          messages: async () => ({ data: messages }),
           create: async () => ({ data: { id: "child-1" } }),
           promptAsync: async (args: { body: { parts?: Array<{ text?: string }> } }) => {
-            fed = (args.body.parts ?? []).map((p) => p.text ?? "").join("")
+            fed.value = (args.body.parts ?? []).map((p) => p.text ?? "").join("")
             return {}
           },
         },
-        app: deps.client.app,
       },
     }
-    await spawnWriter(capturing, target, state)
-    return { fed, truncated: !fed.includes("#11") }
   }
-  test("the increment is cut at the budget, and the tail is never fed", async () => {
+
+  test("the increment is cut at the budget and the tail is not fed", async () => {
     const root = tempRoot()
     const { db } = createDb()
     const target = createTarget(root)
-    // 12 × ~20KB = ~240KB, comfortably past the 135K budget.
-    const deps = createDeps(root, db, async () => ({ data: session(12) }))
+    const fed = { value: "" }
     try {
-      const { fed, truncated } = await spawnAndCapture(deps, target)
-      expect(fed.length).toBeGreaterThan(0)
-      // The first messages made it in; the last one did not.
-      expect(fed).toContain("#0")
-      expect(fed).not.toContain("#11")
-      expect(truncated).toBe(true)
+      const msgs = session(12)
+      await spawnWriter(dispatchDeps(root, db, msgs, fed), target, new Map())
+      expect(fed.value).toContain("#0")
+      expect(fed.value).not.toContain("#11")
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
   })
 
-  test("the watermark then jumps past the unread tail, stranding it forever", async () => {
+  test("the watermark lands on the last fully-fed message, not the dispatch time", async () => {
     const root = tempRoot()
     const { db } = createDb()
     const target = createTarget(root)
     const state = new Map<string, PendingWriter>()
-    // The child replays a well-formed checkpoint so finalisation succeeds.
-    const childCheckpoint = async () => ({
-      data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: checkpoint }] }],
-    })
-    const deps = createDeps(root, db, async () => ({ data: session(12) }))
+    const fed = { value: "" }
     try {
       fs.mkdirSync(path.join(root, "sessions", target.sessionID), { recursive: true })
+      const msgs = session(12)
+      await spawnWriter(dispatchDeps(root, db, msgs, fed), target, state)
+      const pending = state.get(target.sessionID)
+      expect(pending).toBeDefined()
+      expect(pending?.truncated).toBe(true)
+      // The cursor is the newest message that made it into the prompt, which is
+      // strictly older than the newest message in the session.
+      expect(pending?.lastConsumed).toBeGreaterThan(0)
+      expect(pending?.lastConsumed).toBeLessThan(BASE + 11_000)
 
-      // Round 1: spawn (reads a truncated increment), then settle.
-      const dispatchDeps: WriterDeps = {
-        ...deps,
-        client: {
-          session: {
-            messages: deps.client.session.messages,
-            create: async () => ({ data: { id: "child-1" } }),
-            promptAsync: async () => ({}),
-          },
-        },
-      }
-      await spawnWriter(dispatchDeps, target, state)
-      const lastFed = BASE + 11_000 // timestamp of the newest message in the session
-      const settleDeps = createDeps(root, db, childCheckpoint)
-      await finalizeWriter(settleDeps, target, "child-1")
+      await settleWriter(createDeps(root, db, childCheckpoint), state, "child-1")
+
       const watermark = lastCheckpointMs(db, target.sessionID)
-
-      // The defect: the watermark is "now", not "last message read". It sits
-      // above m11 — the message that was never fed to the child.
-      expect(watermark).toBeGreaterThan(lastFed)
-
-      // Round 2: nothing new arrived, yet the unread tail is unreachable —
-      // every message is now at or below the watermark.
-      const reread: string[] = []
-      const secondDeps: WriterDeps = {
-        ...deps,
-        client: {
-          session: {
-            messages: async () => {
-              const since = lastCheckpointMs(db, target.sessionID)
-              for (const m of session(12)) {
-                if (m.info.time.created > since) reread.push(m.info.id)
-              }
-              return { data: [] }
-            },
-            create: async () => ({ data: { id: "child-2" } }),
-            promptAsync: async () => ({}),
-          },
-        },
-      }
-      await spawnWriter(secondDeps, target, new Map())
-      expect(reread).toEqual([])
+      expect(watermark).toBe(pending?.lastConsumed)
+      // The whole point: the unread tail is still above the cursor.
+      expect(watermark).toBeLessThan(BASE + 11_000)
+      expect(lastCheckpointId(db, target.sessionID)).toBe(pending?.lastConsumedId)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
   })
+
+  test("the next batch picks up the tail the first one left behind", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const target = createTarget(root)
+    const state = new Map<string, PendingWriter>()
+    try {
+      fs.mkdirSync(path.join(root, "sessions", target.sessionID), { recursive: true })
+      const msgs = session(12)
+      await spawnWriter(dispatchDeps(root, db, msgs, { value: "" }), target, state)
+      await settleWriter(createDeps(root, db, childCheckpoint), state, "child-1")
+
+      // A fresh read of the same 12 messages must now see the remainder. Before
+      // the cursor this came back empty, which is the loss.
+      const second = { value: "" }
+      await spawnWriter(dispatchDeps(root, db, msgs, second), target, new Map())
+      expect(second.value).toContain("#6")
+      expect(second.value).toContain("#11")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a message cut mid-way by the budget leaves the cursor on the previous one", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const target = createTarget(root)
+    const fed = { value: "" }
+    try {
+      // Two text parts on one message. The budget admits the first and rejects
+      // the second, so the cursor must not claim this message — otherwise the
+      // rejected part is skipped forever. Sized so m0 (60,017B) plus m1's first
+      // part (60,017B) fit inside 135,000 and a third would not.
+      const big = "y".repeat(60_000)
+      const msgs = [
+        { info: { role: "assistant", id: "m0", time: { created: BASE } }, parts: [{ type: "text", text: `${big} a` }] },
+        {
+          info: { role: "assistant", id: "m1", time: { created: BASE + 1_000 } },
+          parts: [
+            { type: "text", text: `${big} b` },
+            { type: "text", text: `${big} c` },
+          ],
+        },
+      ]
+      const state = new Map<string, PendingWriter>()
+      await spawnWriter(dispatchDeps(root, db, msgs, fed), target, state)
+      const pending = state.get(target.sessionID)
+      // m1's second part did not fit, so m1 is not consumed.
+      expect(fed.value).toContain(`${big} b`)
+      expect(fed.value).not.toContain(`${big} c`)
+      expect(pending?.lastConsumed).toBe(BASE)
+      expect(pending?.lastConsumedId).toBe("m0")
+      expect(pending?.truncated).toBe(true)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("sibling messages sharing a millisecond are not skipped", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const target = createTarget(root)
+    const fed = { value: "" }
+    try {
+      markCheckpoint(db, target.sessionID, BASE, "m0")
+      // m1 shares m0's millisecond. A timestamp-only comparison would skip it.
+      const msgs = [
+        { info: { role: "assistant", id: "m0", time: { created: BASE } }, parts: [{ type: "text", text: "one" }] },
+        { info: { role: "assistant", id: "m1", time: { created: BASE } }, parts: [{ type: "text", text: "two" }] },
+        {
+          info: { role: "assistant", id: "m2", time: { created: BASE + 1_000 } },
+          parts: [{ type: "text", text: "three" }],
+        },
+      ]
+      await spawnWriter(dispatchDeps(root, db, msgs, fed), target, new Map())
+      expect(fed.value).not.toContain("one")
+      expect(fed.value).toContain("two")
+      expect(fed.value).toContain("three")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a stale result leaves the watermark where it was", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const target = createTarget(root)
+    try {
+      fs.mkdirSync(path.join(root, "sessions", target.sessionID), { recursive: true })
+      const file = checkpointPath(root, target.sessionID)
+      fs.writeFileSync(file, "# Checkpoint\n## Summary\n更新的内容\n", "utf8")
+      const future = new Date(Date.now() + 10_000)
+      fs.utimesSync(file, future, future)
+
+      const stale = `${checkpoint}\n\n## 补充\n- 迟到结果`
+      const ok = await finalizeWriter(createDeps(root, db, okMessages(stale)), target, "child-stale", {
+        lastConsumed: BASE,
+        lastConsumedId: "m0",
+      })
+      expect(ok).toBe(true)
+      // The batch never reached the file, so claiming its cursor would strand
+      // everything the child did read.
+      expect(lastCheckpointMs(db, target.sessionID)).toBe(0)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a batch with no cursor leaves the watermark alone", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const target = createTarget(root)
+    try {
+      fs.mkdirSync(path.join(root, "sessions", target.sessionID), { recursive: true })
+      await finalizeWriter(createDeps(root, db, okMessages(checkpoint)), target, "child-nocursor")
+      // Unknown cursor must not fall back to the dispatch time.
+      expect(lastCheckpointMs(db, target.sessionID)).toBe(0)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test(
+    "settling a truncated batch re-arms the writer for the next one",
+    // Two 5s poll cycles are inherent here: the watcher only settles on a timer.
+    async () => {
+      const root = tempRoot()
+      const { db } = createDb()
+      const target = createTarget(root)
+      const state = new Map<string, PendingWriter>()
+      const msgs = session(12)
+      const sid = target.sessionID
+      let dispatched = 0
+      const fed: string[] = []
+      try {
+        fs.mkdirSync(path.join(root, "sessions", sid), { recursive: true })
+        // messages() serves both callers: readIncrement asks for the parent,
+        // finalizeWriterOnce asks for the child. The SDK nests the id under
+        // `path`, so that is where it has to be read from. The child reports
+        // idle immediately, so the 5s poll settles and re-arms.
+        const childReply = { data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: checkpoint }] }] }
+        const pick = (args: { path?: { id?: string } }) =>
+          args?.path?.id === sid ? { data: msgs } : childReply
+        const deps: WriterDeps = {
+          ...createDeps(root, db, pick),
+          maxWriterRetries: 3,
+          client: {
+            session: {
+              messages: pick,
+              create: async () => ({ data: { id: `child-${dispatched}` } }),
+              promptAsync: async (args: { body: { parts?: Array<{ text?: string }> } }) => {
+                fed.push((args.body.parts ?? []).map((p) => p.text ?? "").join(""))
+                dispatched += 1
+                return {}
+              },
+              status: async () => ({ data: { type: "idle" } }),
+            },
+          },
+        }
+        runWriter(target, deps, state)
+
+        // Two 5s poll cycles: settle batch one, then its re-arm.
+        for (let i = 0; i < 60 && dispatched < 2; i++) {
+          await new Promise((r) => setTimeout(r, 250))
+        }
+        expect(dispatched).toBeGreaterThanOrEqual(2)
+        // Batch two is fed the tail batch one stopped short of.
+        expect(fed[0]).toContain("#0")
+        expect(fed[1]).toContain("#6")
+        // A third cycle settles batch two, after which the watermark reaches the
+        // newest message and the loop stops on its own — no batch four.
+        for (let i = 0; i < 60 && lastCheckpointMs(db, sid) < BASE + 11_000; i++) {
+          await new Promise((r) => setTimeout(r, 250))
+        }
+        expect(lastCheckpointMs(db, sid)).toBe(BASE + 11_000)
+        await new Promise((r) => setTimeout(r, 1_500))
+        expect(dispatched).toBe(2)
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    },
+    20_000,
+  )
 })
 
 describe("late settle guard", () => {
