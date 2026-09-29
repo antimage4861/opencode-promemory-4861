@@ -370,6 +370,17 @@ async function watchChildCompletion(
       break
     }
   }
+  // Every exit settles and then re-arms, not just the idle one. A batch that
+  // overruns its deadline still settles and still writes — the result is
+  // harvested, the cursor advances, and the remainder is exactly as unread as
+  // it was before. Treating that path as terminal silently truncated the loop
+  // to a single batch, which is how a 58KB increment stopped after the first
+  // 29KB: the child took 270s against a 266s budget, and only the idle branch
+  // re-armed. Observed against a real provider, not reasoned about in advance.
+  const settleAndRearm = async (): Promise<void> => {
+    await settleWriter(deps, state, childSessionID)
+    if (pending) rearmIfTruncated(deps, state, pending)
+  }
   for (;;) {
     await new Promise((r) => setTimeout(r, 5_000))
     if (Date.now() > deadline) {
@@ -385,12 +396,14 @@ async function watchChildCompletion(
       const res = await deps.client.session.status({ path: { id: childSessionID } })
       const status = res?.data as { type?: string } | undefined
       if (status?.type === "idle") {
-        await settleWriter(deps, state, childSessionID)
-        if (pending) rearmIfTruncated(deps, state, pending)
+        await settleAndRearm()
         return
       }
     } catch {
-      await settleWriter(deps, state, childSessionID)
+      // A status call that throws leaves the child's fate unknown. The settle
+      // harvests whatever it wrote, and the re-arm keeps a truncated remainder
+      // from being stranded by a transient API error.
+      await settleAndRearm()
       return
     }
   }
