@@ -389,7 +389,7 @@ async function watchChildCompletion(
         "warn",
         `writer child deadline reached child=${childSessionID} increment_bytes=${incrementBytes} budget_ms=${budget} elapsed_ms=${Date.now() - startedAt}`,
       )
-      await settleWriter(deps, state, childSessionID)
+      await settleAndRearm()
       return
     }
     try {
