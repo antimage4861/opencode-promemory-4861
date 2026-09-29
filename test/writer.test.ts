@@ -617,7 +617,7 @@ describe("increment overflow", () => {
                 dispatched += 1
                 return {}
               },
-              status: async () => ({ data: { type: "idle" } }),
+              status: async () => ({ data: {} }),   // absent = idle
             },
           },
         }
@@ -726,6 +726,7 @@ describe("increment overflow", () => {
       const msgs = session(12)
       const sid = target.sessionID
       let dispatched = 0
+      let childID = ""
       let settled = 0
       try {
         fs.mkdirSync(path.join(root, "sessions", sid), { recursive: true })
@@ -737,13 +738,19 @@ describe("increment overflow", () => {
           client: {
             session: {
               messages: pick,
-              create: async () => ({ data: { id: `child-${dispatched}` } }),
-              promptAsync: async () => {
-                dispatched += 1
-                return {}
-              },
-              // Never idle and never throws: the only exit left is the deadline.
-              status: async () => ({ data: { type: "busy" } }),
+                create: async () => {
+                  childID = `child-${dispatched}`
+                  return { data: { id: childID } }
+                },
+                promptAsync: async () => {
+                  dispatched += 1
+                  return {}
+                },
+                // The child stays in the map, so the only exit left is the
+                // deadline. Keyed by the id actually handed out above, since
+                // /session/status is a map — a hardcoded key would leave the
+                // child absent, which now means idle and would exit early.
+                status: async () => ({ data: { [childID]: { type: "busy" } } }),
             },
           },
         }
@@ -808,7 +815,7 @@ describe("increment overflow", () => {
               },
               // Idle on the first probe, and the clock is already past the
               // deadline. Idle must win, and the loop must end on this poll.
-              status: async () => ({ data: { type: "idle" } }),
+              status: async () => ({ data: {} }),   // absent = idle
             },
             app: {
               log: async (args: { body: { message: string } }) => {
@@ -911,7 +918,7 @@ describe("writer retry cap", () => {
           return { data: { id: "spawned" } }
         },
         promptAsync: async () => ({ data: true }),
-        status: async () => ({ data: { status: { type: "idle" } } }),
+        status: async () => ({ data: {} }),
       },
       app: { log: (a: { body: { level: string; message: string } }) => { logs.push({ level: a.body.level, message: a.body.message }); return Promise.resolve() } },
     } as unknown as WriterDeps["client"]
