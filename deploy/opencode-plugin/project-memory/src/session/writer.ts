@@ -378,6 +378,14 @@ async function watchChildCompletion(
   const budget = childDeadlineMs(incrementBytes)
   const startedAt = Date.now()
   const deadline = startedAt + budget
+  const currentStatus = async (): Promise<string | undefined> => {
+    try {
+      const res = await deps.client.session.status()
+      return (res?.data as Record<string, { type?: string }> | undefined)?.[childSessionID]?.type
+    } catch {
+      return undefined
+    }
+  }
   // Captured before settling: settleWriter removes the entry from state.
   let pending: PendingWriter | undefined
   for (const p of state.values()) {
@@ -399,20 +407,30 @@ async function watchChildCompletion(
   }
   for (;;) {
     await new Promise((r) => setTimeout(r, 5_000))
-    // Status first, deadline second. The order decides what the log claims, and
-    // the poll runs every 5s, so a child that finished at 888s against an 891s
-    // budget used to be recorded as "deadline reached" — indistinguishable from
-    // a child genuinely cut off mid-work. Probing first means the deadline only
-    // fires when the child is still busy, which is the case worth knowing about.
+    // /session/status does not answer for one session — it returns a map of
+    // every session that is NOT idle, keyed by session id:
     //
-    // A real 134KB batch measured 892.5s against that 891.2s budget, and with
-    // this order alone there is no way to tell whether the coefficient is too
-    // low or the poll simply missed the window. After the swap, every
-    // "deadline reached" line is a child that was demonstrably still working.
+    //   { [sessionID]: { type: "busy" | "retry", ... } }
+    //
+    // The server deletes an entry the moment it goes idle
+    // (session/status.ts: `if (status.type === "idle") { …; data.delete(sessionID); return }`),
+    // so an ABSENT id is what idle looks like. Reading `.type` off the map itself
+    // yields undefined forever, which is why this loop only ever left through the
+    // deadline: a 133KB child finished in 36s and the poll sat on it for 1293s.
+    //
+    // The `path` argument is declared `path?: never` on SessionStatusData and is
+    // silently dropped, so passing one only looked plausible.
+    //
+    // Probe first, deadline second: a child that completed just before its budget
+    // expires must settle on the idle branch, and the deadline log is then
+    // reserved for children that really were still running.
     try {
-      const res = await deps.client.session.status({ path: { id: childSessionID } })
-      const status = res?.data as { type?: string } | undefined
-      if (status?.type === "idle") {
+      const res = await deps.client.session.status()
+      const map = res?.data as Record<string, { type?: string }> | undefined
+      const status = map?.[childSessionID]
+      // Absent means idle. `type === "idle"` is also accepted in case a build
+      // ever keeps the entry around after publishing the idle event.
+      if (!status || status.type === "idle") {
         await settleAndRearm()
         return
       }
@@ -424,10 +442,14 @@ async function watchChildCompletion(
       return
     }
     if (Date.now() > deadline) {
+      // Reaching here means the child was in the status map on this same poll,
+      // so it was genuinely still running when the budget ran out. Before the
+      // map semantics were fixed this line fired for children that had finished
+      // seconds earlier, which is what made the coefficient look too low.
       reportFailure(
         deps,
         "warn",
-        `writer child deadline reached child=${childSessionID} increment_bytes=${incrementBytes} budget_ms=${budget} elapsed_ms=${Date.now() - startedAt} status=busy`,
+        `writer child deadline reached child=${childSessionID} increment_bytes=${incrementBytes} budget_ms=${budget} elapsed_ms=${Date.now() - startedAt} status=${(await currentStatus()) ?? "absent"}`,
       )
       await settleAndRearm()
       return
