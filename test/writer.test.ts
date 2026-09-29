@@ -18,8 +18,9 @@ import {
   checkpointPath,
   finalizeWriter,
   persistOrphan,
-  settleWriter,
-  childDeadlineMs,
+    settleWriter,
+    spawnWriter,
+    childDeadlineMs,
   type PendingWriter,
   type WriterDeps,
   type WriterTarget,
@@ -339,6 +340,131 @@ describe("child deadline scaling", () => {
       const budget = childDeadlineMs(bytes)
       expect(budget).toBeGreaterThanOrEqual(previous)
       previous = budget
+    }
+  })
+})
+
+describe("increment overflow", () => {
+  // A known data-loss path, pinned before any fix lands.
+  //
+  // readIncrement stops at INCREMENT_BUDGET and reports full=false, but
+  // finalisation advances the watermark to settleStart — the moment the child
+  // was dispatched, not the time of the last message actually read. Every
+  // message after the cut has a created timestamp below a watermark that jumped
+  // over it, so no later checkpoint can ever select it again. Nothing reports
+  // this: the only signal is one `truncated=true` warn line at dispatch.
+  //
+  // These assert CURRENT behaviour deliberately. A fix for the host loop turns
+  // the last one red — that is the point of pinning it first.
+  const CHUNK = "x".repeat(20_000)
+  const BASE = 1_700_000_000_000
+
+  function session(total: number) {
+    return Array.from({ length: total }, (_, i) => ({
+      info: { role: "assistant", id: `m${i}`, time: { created: BASE + i * 1_000 } },
+      parts: [{ type: "text", text: `${CHUNK} #${i}` }],
+    }))
+  }
+
+  /** Spawn and capture the exact increment handed to the child. */
+  async function spawnAndCapture(
+    deps: WriterDeps,
+    target: WriterTarget,
+  ): Promise<{ fed: string; truncated: boolean }> {
+    let fed = ""
+    const state = new Map<string, PendingWriter>()
+    const capturing: WriterDeps = {
+      ...deps,
+      client: {
+        session: {
+          messages: deps.client.session.messages,
+          create: async () => ({ data: { id: "child-1" } }),
+          promptAsync: async (args: { body: { parts?: Array<{ text?: string }> } }) => {
+            fed = (args.body.parts ?? []).map((p) => p.text ?? "").join("")
+            return {}
+          },
+        },
+        app: deps.client.app,
+      },
+    }
+    await spawnWriter(capturing, target, state)
+    return { fed, truncated: !fed.includes("#11") }
+  }
+  test("the increment is cut at the budget, and the tail is never fed", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const target = createTarget(root)
+    // 12 × ~20KB = ~240KB, comfortably past the 135K budget.
+    const deps = createDeps(root, db, async () => ({ data: session(12) }))
+    try {
+      const { fed, truncated } = await spawnAndCapture(deps, target)
+      expect(fed.length).toBeGreaterThan(0)
+      // The first messages made it in; the last one did not.
+      expect(fed).toContain("#0")
+      expect(fed).not.toContain("#11")
+      expect(truncated).toBe(true)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test("the watermark then jumps past the unread tail, stranding it forever", async () => {
+    const root = tempRoot()
+    const { db } = createDb()
+    const target = createTarget(root)
+    const state = new Map<string, PendingWriter>()
+    // The child replays a well-formed checkpoint so finalisation succeeds.
+    const childCheckpoint = async () => ({
+      data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: checkpoint }] }],
+    })
+    const deps = createDeps(root, db, async () => ({ data: session(12) }))
+    try {
+      fs.mkdirSync(path.join(root, "sessions", target.sessionID), { recursive: true })
+
+      // Round 1: spawn (reads a truncated increment), then settle.
+      const dispatchDeps: WriterDeps = {
+        ...deps,
+        client: {
+          session: {
+            messages: deps.client.session.messages,
+            create: async () => ({ data: { id: "child-1" } }),
+            promptAsync: async () => ({}),
+          },
+        },
+      }
+      await spawnWriter(dispatchDeps, target, state)
+      const lastFed = BASE + 11_000 // timestamp of the newest message in the session
+      const settleDeps = createDeps(root, db, childCheckpoint)
+      await finalizeWriter(settleDeps, target, "child-1")
+      const watermark = lastCheckpointMs(db, target.sessionID)
+
+      // The defect: the watermark is "now", not "last message read". It sits
+      // above m11 — the message that was never fed to the child.
+      expect(watermark).toBeGreaterThan(lastFed)
+
+      // Round 2: nothing new arrived, yet the unread tail is unreachable —
+      // every message is now at or below the watermark.
+      const reread: string[] = []
+      const secondDeps: WriterDeps = {
+        ...deps,
+        client: {
+          session: {
+            messages: async () => {
+              const since = lastCheckpointMs(db, target.sessionID)
+              for (const m of session(12)) {
+                if (m.info.time.created > since) reread.push(m.info.id)
+              }
+              return { data: [] }
+            },
+            create: async () => ({ data: { id: "child-2" } }),
+            promptAsync: async () => ({}),
+          },
+        },
+      }
+      await spawnWriter(secondDeps, target, new Map())
+      expect(reread).toEqual([])
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
     }
   })
 })
