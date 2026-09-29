@@ -36,6 +36,7 @@ const WRITER_DEADLINE_MS = 180_000
 // that carries tools and can block waiting on an approval nobody is watching.
 const WRITER_AGENT = "promem-writer"
 const CP_KEY_PREFIX = "scanner:"
+const CP_ID_KEY_PREFIX = "scanner_id:"
 const FAIL_KEY_PREFIX = "writer_fail:"
 const APPEND_KEY_PREFIX = "project_appended:"
 
@@ -43,6 +44,15 @@ interface OrphanRecord {
   childSessionID: string
   target: WriterTarget
   createdAt: number
+  /**
+   * Cursor captured at dispatch. A restart resumes settlement from the orphan
+   * file, and without the cursor the resumed write would have to fall back to
+   * the dispatch time — reintroducing exactly the jump-over-the-tail this cursor
+   * exists to prevent. 0 on records written by older versions; settlement then
+   * leaves the watermark alone rather than guessing.
+   */
+  lastConsumed: number
+  lastConsumedId: string
 }
 
 export interface WriterTarget {
@@ -70,12 +80,33 @@ export interface PendingWriter {
   childSessionID: string
   createdAt: number
   done: boolean
+  /**
+   * Timestamp and id of the last message handed to this child, and whether the
+   * increment was fully read. Settlement advances the watermark to the cursor
+   * rather than to the dispatch time, and a truncated increment re-arms the
+   * writer for the next batch. 0 / "" means nothing was consumed and no
+   * watermark may move.
+   */
+  lastConsumed: number
+  lastConsumedId: string
+  truncated: boolean
 }
 
 export function lastCheckpointMs(db: Db, sessionID: string): number {
   const raw = metaGet(db, `${CP_KEY_PREFIX}${sessionID}`)
   const n = raw ? Number(raw) : NaN
   return Number.isFinite(n) ? n : 0
+}
+
+/**
+ * Id of the message the cursor last landed on. Timestamps are milliseconds, so
+ * two messages in the same turn can share one; without this the read would skip
+ * every message at the cursor's instant, not just the one it consumed. Empty on
+ * stores written before the cursor existed, which makes the reader fall back to
+ * the timestamp-only comparison.
+ */
+export function lastCheckpointId(db: Db, sessionID: string): string {
+  return metaGet(db, `${CP_ID_KEY_PREFIX}${sessionID}`) ?? ""
 }
 
 /**
@@ -99,10 +130,13 @@ function reportFailure(deps: WriterDeps, level: "warn" | "error", message: strin
  * an unconditional Date.now() meant the later-to-settle one pushed the mark
  * past a window the other had not recorded yet, skipping it for good.
  */
-export function markCheckpoint(db: Db, sessionID: string, ms = Date.now()): boolean {
+export function markCheckpoint(db: Db, sessionID: string, ms = Date.now(), messageID = ""): boolean {
   const key = `${CP_KEY_PREFIX}${sessionID}`
   if (lastCheckpointMs(db, sessionID) >= ms) return false
   metaSet(db, key, String(ms))
+  // Always written, even when empty: a legacy cursor that advanced without an id
+  // must not keep the empty-value fallback alive for a session that now has one.
+  metaSet(db, `${CP_ID_KEY_PREFIX}${sessionID}`, messageID)
   return true
 }
 
@@ -125,6 +159,8 @@ export function clearWriterFail(db: Db, sessionID: string): void {
 async function readIncrement(deps: WriterDeps, target: WriterTarget): Promise<{
   body: string
   full: boolean
+  lastConsumed: number
+  lastConsumedId: string
   model?: { providerID: string; modelID: string }
 }> {
   const res = await deps.client.session.messages({ path: { id: target.sessionID } })
@@ -133,30 +169,52 @@ async function readIncrement(deps: WriterDeps, target: WriterTarget): Promise<{
     parts?: Array<{ type?: string; text?: string }>
   }>
   const since = lastCheckpointMs(deps.db, target.sessionID)
+  const sinceId = lastCheckpointId(deps.db, target.sessionID)
   const selected: string[] = []
   let bytes = 0
   let full = true
   let model: { providerID: string; modelID: string } | undefined
+  // The cursor records the last message handed over in full — never the dispatch
+  // time. Moving it past a message the child never saw is what strands the tail
+  // of an oversized increment: those messages end up below a watermark that
+  // jumped over them, and no later read can select them again.
+  //
+  // Recorded only once every text part of a message fits. A message cut mid-way
+  // leaves the cursor on the previous one, so that whole message is re-read next
+  // round — a duplicate the append idempotency absorbs, traded against never
+  // dropping a part.
+  let lastConsumed = 0
+  let lastConsumedId = ""
   for (const m of messages) {
     if (!model && m.info?.model?.providerID && m.info.model.modelID) {
       model = { providerID: m.info.model.providerID, modelID: m.info.model.modelID }
     }
     if (m.info?.role === "user") continue
     const created = m.info?.time?.created ?? 0
-    if (since > 0 && created <= since) continue
+    if (since > 0 && created <= since) {
+      // Messages can share a millisecond. `<=` alone would skip the siblings
+      // following the one the cursor landed on, so an id disambiguates the
+      // boundary. An absent id (store written before this version) falls back to
+      // the old behaviour.
+      if (created < since || sinceId === "" || m.info?.id === sinceId) continue
+    }
+    let complete = true
     for (const p of m.parts ?? []) {
       if (p.type !== "text" || !p.text) continue
       const line = `[${m.info?.role ?? "assistant"} ${m.info?.id ?? ""}]\n${p.text}\n`
       if (bytes + Buffer.byteLength(line) > INCREMENT_BUDGET) {
         full = false
+        complete = false
         break
       }
       selected.push(line)
       bytes += Buffer.byteLength(line)
     }
-    if (!full) break
+    if (!complete) break
+    lastConsumed = created
+    lastConsumedId = m.info?.id ?? ""
   }
-  return { body: selected.join("\n"), full, model }
+  return { body: selected.join("\n"), full, lastConsumed, lastConsumedId, model }
 }
 
 export async function spawnWriter(deps: WriterDeps, target: WriterTarget, state: Map<string, PendingWriter>): Promise<void> {
@@ -196,6 +254,9 @@ export async function spawnWriter(deps: WriterDeps, target: WriterTarget, state:
       childSessionID,
       createdAt: Date.now(),
       done: false,
+      lastConsumed: inc.lastConsumed,
+      lastConsumedId: inc.lastConsumedId,
+      truncated: !inc.full,
     }
     state.set(target.sessionID, pending)
     const userParts = [
@@ -207,7 +268,10 @@ export async function spawnWriter(deps: WriterDeps, target: WriterTarget, state:
       path: { id: childSessionID },
       body: promptBody,
     })
-    await persistOrphan(deps.root, target, childSessionID)
+    await persistOrphan(deps.root, target, childSessionID, {
+      lastConsumed: inc.lastConsumed,
+      lastConsumedId: inc.lastConsumedId,
+    })
     void watchChildCompletion(deps, state, childSessionID, incrementBytes)
   } catch (e) {
     state.delete(target.sessionID)
@@ -247,6 +311,48 @@ export function childDeadlineMs(incrementBytes: number): number {
   return Math.round(Math.max(WRITER_DEADLINE_MS, scaled * CHILD_DEADLINE_SLACK))
 }
 
+/**
+ * Re-arm the writer for the next batch once a truncated increment has landed.
+ *
+ * The cursor makes this safe to loop: each batch advances the watermark to the
+ * last message it actually fed, so the next read starts exactly where the
+ * previous one stopped. Without that, the loop would re-read the same window
+ * forever.
+ *
+ * Re-arming requires the watermark to have actually moved. A batch that was
+ * rejected, produced no output, or lost the stale race never advanced it, and
+ * retrying would re-distil a window the cursor still points at — a spin, not
+ * progress. The failure counter is checked as well so a broken target is left
+ * for the retry cap rather than looped.
+ */
+function rearmIfTruncated(
+  deps: WriterDeps,
+  state: Map<string, PendingWriter>,
+  pending: PendingWriter,
+): void {
+  if (!pending.truncated) return
+  if (pending.lastConsumed <= 0) {
+    reportFailure(
+      deps,
+      "warn",
+      `writer loop stopped session=${pending.target.sessionID} truncated increment consumed no complete message`,
+    )
+    return
+  }
+  const limit = deps.maxWriterRetries ?? 3
+  if (writerFailCount(deps.db, pending.target.sessionID) >= limit) return
+  if (state.has(pending.target.sessionID)) return
+  if (lastCheckpointMs(deps.db, pending.target.sessionID) < pending.lastConsumed) {
+    reportFailure(
+      deps,
+      "warn",
+      `writer loop stopped session=${pending.target.sessionID} watermark did not reach cursor=${pending.lastConsumed}`,
+    )
+    return
+  }
+  runWriter(pending.target, deps, state)
+}
+
 async function watchChildCompletion(
   deps: WriterDeps,
   state: Map<string, PendingWriter>,
@@ -256,6 +362,14 @@ async function watchChildCompletion(
   const budget = childDeadlineMs(incrementBytes)
   const startedAt = Date.now()
   const deadline = startedAt + budget
+  // Captured before settling: settleWriter removes the entry from state.
+  let pending: PendingWriter | undefined
+  for (const p of state.values()) {
+    if (p.childSessionID === childSessionID) {
+      pending = p
+      break
+    }
+  }
   for (;;) {
     await new Promise((r) => setTimeout(r, 5_000))
     if (Date.now() > deadline) {
@@ -272,6 +386,7 @@ async function watchChildCompletion(
       const status = res?.data as { type?: string } | undefined
       if (status?.type === "idle") {
         await settleWriter(deps, state, childSessionID)
+        if (pending) rearmIfTruncated(deps, state, pending)
         return
       }
     } catch {
@@ -303,7 +418,22 @@ export function runWriter(task: WriterTarget, deps: WriterDeps, state: Map<strin
   void spawnWriter(deps, task, state)
 }
 
-async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childSessionID: string): Promise<boolean> {
+/**
+ * Cursor for one settled batch. `0` means unknown — settlement then leaves the
+ * watermark alone instead of guessing at the dispatch time, because a wrong
+ * guess skips messages permanently and a missing one only costs a re-read.
+ */
+export interface WriterCursor {
+  lastConsumed: number
+  lastConsumedId: string
+}
+
+async function finalizeWriterOnce(
+  deps: WriterDeps,
+  target: WriterTarget,
+  childSessionID: string,
+  cursor?: WriterCursor,
+): Promise<boolean> {
   const settleStart = Date.now()
   try {
     const res = await deps.client.session.messages({ path: { id: childSessionID } })
@@ -453,8 +583,36 @@ async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childS
       )
     }
     if (checkpointWrite.ok && projectWrite) {
-      markCheckpoint(deps.db, target.sessionID, settleStart)
-      clearWriterFail(deps.db, target.sessionID)
+      // The watermark tracks the cursor, not the dispatch time. settleStart sits
+      // above every message the child never received, so using it here stranded
+      // the unread tail of an oversized increment: those messages fell below a
+      // mark that had jumped over them and no later read could select them.
+      //
+      // A stale result keeps the watermark still even though the writes "succeeded":
+      // this batch's content is not in the checkpoint file, and moving the cursor
+      // would claim it was. The project append above still runs — it has its own
+      // idempotency token and may cover a window the newer result missed.
+      const lastConsumed = cursor?.lastConsumed ?? 0
+      if (stale) {
+        reportFailure(
+          deps,
+          "warn",
+          `watermark held at cursor session=${target.sessionID} cursor=${lastConsumed} reason=stale result not written`,
+        )
+        // Not clearing the failure count: the retry cap is what stops the loop
+        // from re-reading this window, and the batch still needs another pass.
+        bumpWriterFail(deps.db, target.sessionID)
+      } else if (lastConsumed <= 0) {
+        reportFailure(
+          deps,
+          "warn",
+          `watermark not advanced session=${target.sessionID} reason=no cursor recorded for this batch`,
+        )
+        bumpWriterFail(deps.db, target.sessionID)
+      } else {
+        markCheckpoint(deps.db, target.sessionID, lastConsumed, cursor?.lastConsumedId ?? "")
+        clearWriterFail(deps.db, target.sessionID)
+      }
     } else {
       const failures = bumpWriterFail(deps.db, target.sessionID)
       reportFailure(
@@ -470,10 +628,15 @@ async function finalizeWriterOnce(deps: WriterDeps, target: WriterTarget, childS
   return true
 }
 
-export function finalizeWriter(deps: WriterDeps, target: WriterTarget, childSessionID: string): Promise<boolean> {
+export function finalizeWriter(
+  deps: WriterDeps,
+  target: WriterTarget,
+  childSessionID: string,
+  cursor?: WriterCursor,
+): Promise<boolean> {
   const active = deps.finalizing.get(childSessionID)
   if (active) return active
-  const task = finalizeWriterOnce(deps, target, childSessionID)
+  const task = finalizeWriterOnce(deps, target, childSessionID, cursor)
   deps.finalizing.set(childSessionID, task)
   const clear = () => {
     if (deps.finalizing.get(childSessionID) === task) deps.finalizing.delete(childSessionID)
@@ -492,12 +655,20 @@ async function settleWriterOnce(deps: WriterDeps, state: Map<string, PendingWrit
   }
   if (!pending) {
     const orphan = await findOrphan(deps.root, childSessionID)
-    if (orphan) return finalizeWriter(deps, orphan.target, orphan.childSessionID)
+    if (orphan) {
+      return finalizeWriter(deps, orphan.target, orphan.childSessionID, {
+        lastConsumed: orphan.lastConsumed ?? 0,
+        lastConsumedId: orphan.lastConsumedId ?? "",
+      })
+    }
     return false
   }
   pending.done = true
   state.delete(pending.target.sessionID)
-  return finalizeWriter(deps, pending.target, childSessionID)
+  return finalizeWriter(deps, pending.target, childSessionID, {
+    lastConsumed: pending.lastConsumed,
+    lastConsumedId: pending.lastConsumedId,
+  })
 }
 
 export function settleWriter(deps: WriterDeps, state: Map<string, PendingWriter>, childSessionID: string): Promise<boolean> {
@@ -638,10 +809,21 @@ function writeOrphans(root: string, records: OrphanRecord[]) {
   fs.writeFileSync(orphanFile(root), JSON.stringify(records, null, 0), "utf8")
 }
 
-export async function persistOrphan(root: string, target: WriterTarget, childSessionID: string): Promise<void> {
+export async function persistOrphan(
+  root: string,
+  target: WriterTarget,
+  childSessionID: string,
+  cursor?: { lastConsumed: number; lastConsumedId: string },
+): Promise<void> {
   await withFileLock(orphanFile(root), () => {
     const records = readOrphans(root).filter((r) => r.childSessionID !== childSessionID)
-    records.push({ childSessionID, target, createdAt: Date.now() })
+    records.push({
+      childSessionID,
+      target,
+      createdAt: Date.now(),
+      lastConsumed: cursor?.lastConsumed ?? 0,
+      lastConsumedId: cursor?.lastConsumedId ?? "",
+    })
     writeOrphans(root, records)
   })
 }
