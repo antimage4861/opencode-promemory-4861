@@ -746,6 +746,85 @@ describe("increment overflow", () => {
     },
     25_000,
   )
+
+  test(
+    "a child that is idle but past the deadline is reported as idle, not as a timeout",
+    // The poll runs every 5s, so a child finishing at 888s against an 891s
+    // budget lands on a poll where the deadline has already passed. Checking the
+    // deadline first recorded that as "deadline reached" — the same log line a
+    // genuinely cut-off child produces, leaving no way to tell whether the
+    // coefficient is too low or the poll merely missed the window. Observed on a
+    // real 134KB batch: 892.5s against 891.2s.
+    async () => {
+      const root = tempRoot()
+      const { db } = createDb()
+      const target = createTarget(root)
+      const state = new Map<string, PendingWriter>()
+      const msgs = session(12)
+      const sid = target.sessionID
+      const logs: string[] = []
+      let dispatched = 0
+      try {
+        fs.mkdirSync(path.join(root, "sessions", sid), { recursive: true })
+        const childReply = { data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: checkpoint }] }] }
+        const pick = (args: { path?: { id?: string } }) => (args?.path?.id === sid ? { data: msgs } : childReply)
+        const deps: WriterDeps = {
+          ...createDeps(root, db, pick),
+          maxWriterRetries: 3,
+          client: {
+            session: {
+              messages: pick,
+              create: async () => ({ data: { id: `child-${dispatched}` } }),
+              promptAsync: async () => {
+                dispatched += 1
+                return {}
+              },
+              // Idle on the first probe, and the clock is already past the
+              // deadline. Idle must win, and the loop must end on this poll.
+              status: async () => ({ data: { type: "idle" } }),
+            },
+            app: {
+              log: async (args: { body: { message: string } }) => {
+                logs.push(args.body.message)
+              },
+            },
+          },
+        }
+        const realNow = Date.now
+        const t0 = realNow()
+        let jumped = false
+        // Jump the clock once real time has moved on, not after a fixed number
+        // of Date.now calls. Everything before the first poll — pending.createdAt,
+        // the orphan record, startedAt — happens within milliseconds, and the
+        // poll then sleeps 5 real seconds. Counting calls instead would be
+        // brittle: an unrelated timestamp added anywhere upstream would shift
+        // the count and silently stop the test discriminating anything.
+        Date.now = () => {
+          const real = realNow()
+          if (!jumped && real - t0 > 1_000) jumped = true
+          return jumped ? real + 10_000_000 : real
+        }
+        try {
+          runWriter(target, deps, state)
+          // Wait for the settle, not the dispatch: `dispatched` flips during
+          // spawnWriter, while settlement only happens on the first 5s poll.
+          for (let i = 0; i < 60 && lastCheckpointMs(db, sid) === 0; i++) {
+            await new Promise((r) => setTimeout(r, 250))
+          }
+        } finally {
+          Date.now = realNow
+        }
+        // Settled through the idle branch: no timeout line was logged, and the
+        // cursor advanced.
+        expect(dispatched).toBeGreaterThanOrEqual(1)
+        expect(logs.some((l) => l.includes("deadline reached"))).toBe(false)
+        expect(lastCheckpointMs(db, sid)).toBeGreaterThan(0)
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    },
+    20_000,
+  )
 })
 
 describe("late settle guard", () => {
