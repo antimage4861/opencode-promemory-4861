@@ -677,6 +677,75 @@ describe("increment overflow", () => {
     },
     20_000,
   )
+
+  test(
+    "the deadline branch re-arms, not just idle and throw",
+    // The call site that actually broke twice. d822c2a claimed to fix the
+    // deadline branch but shipped it unfixed: a `cp` of an already-deleted
+    // backup restored nothing, the mutation went unnoticed because the
+    // negative test's replace was a no-op, and every test still passed. Only a
+    // real 134KB run against a live provider caught it — the loop stopped after
+    // one batch again.
+    //
+    // The clock is advanced monotonically so each batch crosses its own
+    // deadline on the first poll and the chain converges. An earlier attempt
+    // froze the offset, which left the last batch's watcher polling forever once
+    // the clock was restored, and its errors landed on unrelated tests.
+    async () => {
+      const root = tempRoot()
+      const { db } = createDb()
+      const target = createTarget(root)
+      const state = new Map<string, PendingWriter>()
+      const msgs = session(12)
+      const sid = target.sessionID
+      let dispatched = 0
+      let settled = 0
+      try {
+        fs.mkdirSync(path.join(root, "sessions", sid), { recursive: true })
+        const childReply = { data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: checkpoint }] }] }
+        const pick = (args: { path?: { id?: string } }) => (args?.path?.id === sid ? { data: msgs } : childReply)
+        const deps: WriterDeps = {
+          ...createDeps(root, db, pick),
+          maxWriterRetries: 3,
+          client: {
+            session: {
+              messages: pick,
+              create: async () => ({ data: { id: `child-${dispatched}` } }),
+              promptAsync: async () => {
+                dispatched += 1
+                return {}
+              },
+              // Never idle and never throws: the only exit left is the deadline.
+              status: async () => ({ data: { type: "busy" } }),
+            },
+          },
+        }
+        const realNow = Date.now
+        let ticks = 0
+        Date.now = () => (++ticks <= 2 ? realNow() : realNow() + ticks * 10_000_000)
+        try {
+          runWriter(target, deps, state)
+          for (let i = 0; i < 60; i++) {
+            await new Promise((r) => setTimeout(r, 250))
+            settled = lastCheckpointMs(db, sid)
+            if (settled >= BASE + 11_000) break
+          }
+        } finally {
+          Date.now = realNow
+        }
+        // Two batches of 12 × 20KB against a 135K budget, both settled through
+        // the deadline branch.
+        expect(dispatched).toBe(2)
+        expect(settled).toBe(BASE + 11_000)
+        const after = dispatched
+        await new Promise((r) => setTimeout(r, 1_500))
+        expect(dispatched).toBe(after)
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    },
+    25_000,
+  )
 })
 
 describe("late settle guard", () => {
