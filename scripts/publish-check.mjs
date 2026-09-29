@@ -86,6 +86,35 @@ if (srcWriter && distBundle) {
   }
 }
 
+// deploy/ ships as a hand-maintained copy of the shared modules so a single
+// tarball can be dropped into both the plugin and command locations.
+// `gen:deploy-entry --check` only compares the entry file's import list, so a
+// stale shared module in the copy passes the whole gate — which is how a cursor
+// fix reached src/ and left deploy/ a release behind.
+//
+// The shared set is read from sync-deploy.mjs rather than re-listed: a second
+// copy of that list would drift, and the drift would read as "deploy is fine".
+const DEPLOY_SHARED = "deploy/opencode-plugin/project-memory/src"
+const syncSrc = await readF(new URL("scripts/sync-deploy.mjs", root), "utf8").catch(() => "")
+const sharedList = [...syncSrc.matchAll(/^\s*"([^"]+\.(?:ts|txt))",$/gm)].map((m) => m[1])
+if (sharedList.length === 0) {
+  problems.push("无法从 scripts/sync-deploy.mjs 解析共享文件清单,deploy 一致性检查无效")
+} else {
+  const drift = []
+  for (const rel of sharedList) {
+    const from = await readF(new URL(`src/${rel}`, root), "utf8").catch(() => null)
+    const to = await readF(new URL(`${DEPLOY_SHARED}/${rel}`, root), "utf8").catch(() => null)
+    if (from === null) drift.push(`${rel} (src 缺失)`)
+    else if (to === null) drift.push(`${rel} (deploy 缺失)`)
+    else if (to !== from) drift.push(`${rel} (内容不同)`)
+  }
+  if (drift.length > 0) {
+    problems.push(`deploy 副本与 src 不一致:${drift.join(", ")} — 请先 npm run sync:deploy`)
+  } else {
+    ok.push(`deploy 副本与 src 一致(${sharedList.length} 个共享文件)`)
+  }
+}
+
 if (problems.length > 0) {
   console.error("✗ 发布前检查未通过:")
   for (const p of problems) console.error(`  - ${p}`)
