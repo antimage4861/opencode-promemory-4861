@@ -618,6 +618,65 @@ describe("increment overflow", () => {
     },
     20_000,
   )
+
+  test(
+    "a status call that throws still re-arms the loop",
+    // Regression from a real 29KB run against a live provider: the batch
+    // overran its deadline, and only the idle branch re-armed, so the loop ended
+    // after one batch and the remaining 29KB was stranded. The idle-only test
+    // above could not catch it — its mock reports idle, the one path that
+    // already worked. Exercised here through the throw path, which reaches the
+    // same settleAndRearm helper without having to fake a 180s+ clock; the
+    // deadline branch shares that helper and is the one that actually fired.
+    async () => {
+      const root = tempRoot()
+      const { db } = createDb()
+      const target = createTarget(root)
+      const state = new Map<string, PendingWriter>()
+      const msgs = session(12)
+      const sid = target.sessionID
+      let dispatched = 0
+      try {
+        fs.mkdirSync(path.join(root, "sessions", sid), { recursive: true })
+        const childReply = { data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: checkpoint }] }] }
+        const pick = (args: { path?: { id?: string } }) => (args?.path?.id === sid ? { data: msgs } : childReply)
+        const deps: WriterDeps = {
+          ...createDeps(root, db, pick),
+          maxWriterRetries: 3,
+          client: {
+            session: {
+              messages: pick,
+              create: async () => ({ data: { id: `child-${dispatched}` } }),
+              promptAsync: async () => {
+                dispatched += 1
+                return {}
+              },
+              status: async () => {
+                throw new Error("status unavailable")
+              },
+            },
+          },
+        }
+        runWriter(target, deps, state)
+        // 12 × 20KB against a 135K budget is two batches, each settling on one
+        // throw. Wait for the chain to finish so no watcher outlives the test.
+        let settled = 0
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => setTimeout(r, 250))
+          settled = lastCheckpointMs(db, sid)
+          if (settled >= BASE + 11_000) break
+        }
+        expect(dispatched).toBeGreaterThanOrEqual(2)
+        expect(settled).toBe(BASE + 11_000)
+        const after = dispatched
+        await new Promise((r) => setTimeout(r, 1_500))
+        expect(dispatched).toBe(after)
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    },
+    20_000,
+  )
 })
 
 describe("late settle guard", () => {
