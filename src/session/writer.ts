@@ -383,15 +383,16 @@ async function watchChildCompletion(
   }
   for (;;) {
     await new Promise((r) => setTimeout(r, 5_000))
-    if (Date.now() > deadline) {
-      reportFailure(
-        deps,
-        "warn",
-        `writer child deadline reached child=${childSessionID} increment_bytes=${incrementBytes} budget_ms=${budget} elapsed_ms=${Date.now() - startedAt}`,
-      )
-      await settleAndRearm()
-      return
-    }
+    // Status first, deadline second. The order decides what the log claims, and
+    // the poll runs every 5s, so a child that finished at 888s against an 891s
+    // budget used to be recorded as "deadline reached" — indistinguishable from
+    // a child genuinely cut off mid-work. Probing first means the deadline only
+    // fires when the child is still busy, which is the case worth knowing about.
+    //
+    // A real 134KB batch measured 892.5s against that 891.2s budget, and with
+    // this order alone there is no way to tell whether the coefficient is too
+    // low or the poll simply missed the window. After the swap, every
+    // "deadline reached" line is a child that was demonstrably still working.
     try {
       const res = await deps.client.session.status({ path: { id: childSessionID } })
       const status = res?.data as { type?: string } | undefined
@@ -403,6 +404,15 @@ async function watchChildCompletion(
       // A status call that throws leaves the child's fate unknown. The settle
       // harvests whatever it wrote, and the re-arm keeps a truncated remainder
       // from being stranded by a transient API error.
+      await settleAndRearm()
+      return
+    }
+    if (Date.now() > deadline) {
+      reportFailure(
+        deps,
+        "warn",
+        `writer child deadline reached child=${childSessionID} increment_bytes=${incrementBytes} budget_ms=${budget} elapsed_ms=${Date.now() - startedAt} status=busy`,
+      )
       await settleAndRearm()
       return
     }
