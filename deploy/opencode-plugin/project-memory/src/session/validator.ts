@@ -14,14 +14,31 @@ const REQUIRED_SECTIONS = [
   "## Notes",
 ]
 
-const MAX_CHECKPOINT_BYTES = 10 * 1024
+/**
+ * Hard ceiling on the whole checkpoint. Exceeding it is a rejection, so a
+ * checkpoint that trips this is lost along with its watermark advance.
+ *
+ * Raised from 10KB after a real run: a 131,544-byte increment (the full
+ * INCREMENT_BUDGET) distilled to 16,067 bytes, over the old 10,240 limit by 56%.
+ * The batch was rejected, the watermark stayed put, and the host loop stopped
+ * after one batch — a full-size increment became unprocessable.
+ *
+ * 24KB clears the observed worst case with room to spare, and stays a real bound:
+ * the section budgets below sum to 7400, and a checkpoint three times that is
+ * still worth rejecting rather than truncating silently.
+ *
+ * Known weakness, unchanged here: the child does not respect the per-section
+ * budgets — the 16KB output overshot every one of them by roughly 10x. Until the
+ * prompt or the model holds to them, this ceiling is the only gate, so it has to
+ * sit above what the model actually produces for a full-budget input. The real
+ * fix is making the sections obey their budgets; this only moves the cliff.
+ */
+const MAX_CHECKPOINT_BYTES = 24 * 1024
 
 /**
  * Per-section byte budgets. Overshooting one is reported as a warning, never a
  * rejection: a rejected checkpoint is silently lost, which is the failure mode
- * this whole check exists to make visible. Budgets sum to 7400, comfortably
- * inside MAX_CHECKPOINT_BYTES, so hitting a section budget normally trips the
- * total-size error first and the writer surfaces a real reason.
+ * this whole check exists to make visible. Budgets sum to 7400.
  */
 export const SECTION_BUDGET_BYTES: Record<string, number> = {
   "## Summary": 800,

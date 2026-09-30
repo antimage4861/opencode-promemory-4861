@@ -6,6 +6,7 @@ import { resolveProjectId } from "../src/memory/paths.ts"
 import { projectMemoryTemplate } from "../src/memory/template.ts"
 import { GLOBAL_CAP, SECTION_CAPS, extractDelta, mergeGlobalMemory, migrateMemoryLayout, normalizeBullets } from "../src/memory/merge.ts"
 import { describeDreamDiff, diffProjectMemory, snapshotProjectMemory } from "../src/session/dream.ts"
+import { validateCheckpoint, SECTION_BUDGET_BYTES } from "../src/session/validator.ts"
 import type { Db } from "../src/memory/db.ts"
 import {
   bumpWriterFail,
@@ -374,6 +375,50 @@ describe("watermark monotonicity", () => {
       }
     })
   })
+
+describe("checkpoint size ceiling", () => {
+  // A real full-budget run: a 131,544-byte increment distilled to 16,067 bytes,
+  // which the old 10,240 ceiling rejected. The rejection held the watermark, so
+  // the host loop stopped after one batch and the rest of the increment was
+  // never processed — a full-size increment was simply unprocessable.
+  const REAL_OUTPUT_BYTES = 16_067
+
+  function sized(base: string, targetBytes: number): string {
+    // Grow one section until the body reaches targetBytes, so the test uses a
+    // real byte count rather than a guess. The "- " and newline added below
+    // are part of the body, so they come out of the budget — otherwise the
+    // result overshoots the target by exactly those 3 bytes.
+    const INJECTED = 3 // "\n" + "- "
+    const need = targetBytes - Buffer.byteLength(base, "utf8") - INJECTED
+    expect(INJECTED).toBe(Buffer.byteLength("\n- ", "utf8"))
+    return base.replace("## Notes", `## Notes\n- ${"x".repeat(Math.max(0, need))}`)
+  }
+
+  test("accepts a checkpoint the size a full-budget run actually produces", () => {
+    const body = sized(checkpoint, REAL_OUTPUT_BYTES)
+    expect(Buffer.byteLength(body, "utf8")).toBe(REAL_OUTPUT_BYTES)
+    const verdict = validateCheckpoint(body)
+    // Overshooting section budgets is a warning, never a rejection.
+    expect(verdict.errors.filter((e) => e.includes("size exceeds"))).toEqual([])
+    expect(verdict.ok).toBe(true)
+  })
+
+  test("still rejects a checkpoint far past the ceiling", () => {
+    const body = sized(checkpoint, 64 * 1024)
+    const verdict = validateCheckpoint(body)
+    expect(verdict.ok).toBe(false)
+    expect(verdict.errors.some((e) => e.includes("size exceeds"))).toBe(true)
+  })
+
+  test("the ceiling clears the sum of the section budgets", () => {
+    const sum = Object.values(SECTION_BUDGET_BYTES).reduce((a, b) => a + b, 0)
+    // A well-behaved child fits inside the section budgets, so the ceiling must
+    // be well clear of them or a compliant checkpoint could still be rejected.
+    const ceiling = validateCheckpoint(sized(checkpoint, 24 * 1024 - 1))
+    expect(sum).toBeLessThan(24 * 1024)
+    expect(ceiling.errors.filter((e) => e.includes("size exceeds"))).toEqual([])
+  })
+})
 
 describe("increment overflow", () => {
   // Regression cover for the data-loss path that used to sit here.
