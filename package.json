@@ -43,7 +43,8 @@
     "sync:deploy": "node scripts/sync-deploy.mjs",
     "release": "node scripts/github-release.mjs",
     "gen:prompt": "node scripts/gen-prompt.mjs",
-    "gen:deploy-entry": "node scripts/gen-deploy-entry.mjs"
+    "gen:deploy-entry": "node scripts/gen-deploy-entry.mjs",
+    "verify:published": "node scripts/verify-published.mjs"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.9",

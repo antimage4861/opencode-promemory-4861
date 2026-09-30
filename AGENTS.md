@@ -112,12 +112,16 @@ grep -n "var CHILD_DEADLINE_MS_PER_BYTE" /tmp/regcheck/package/dist/index.js
 | 12 | 负向验证的 `replace` | 目标行本来就是原样，replace **空操作**；「没有测试失败」被读成「该分支无覆盖」 | 先断言变异生效 |
 | 13 | `session.status` 的返回结构 | 该端点返回**映射表** `{[sessionID]: SessionStatus}`，且 `path?: never`——旧代码传 `path` 并直接读 `.type`，恒为 `undefined` | 读 SDK 类型 + 服务端源码 |
 | 14 | `status=busy` 这个日志字段 | 因 #13，map 恒空，busy 与 idle **两种情况都记成 busy**，被当作「子代理仍在工作」的证据用了三轮 | 判据必须能证伪 |
+| 15 | `git checkout -- package.json` 恢复版本号 | 负向验证要改版本号，撤销时把**同一次修改里的 scripts 条目一并回退**，只检查了版本号 —— 文件在 main 上而条目不在，`npm run verify:published` 报 Missing script | 恢复后核对**整个文件的 diff**，不只预期的字段 |
+| 16 | 0.6.8 的发布 | release PR 合并了、tarball 打了、内部也核对了，**从未执行 `npm publish`**。registry 上没有该版本，用户装到上一个，而 git 里有 tag。没有任何一步会失败 | 见发布流程的 `verify:published`，它不是可选的 |
 
 第 11、12 条叠在一起，让 `0.6.6` 声称修好的 deadline 分支**根本没修**，而单元测试、负向验证、CHANGELOG 全部显示正常。只有真实 provider 实测才暴露。
 
 第 13、14 条更隐蔽：idle 分支从不命中，所有批次都等满 deadline，而由此拟合出的「6.01 ms/字节」看起来极其合理——**被 deadline 约束的时间序列，拟合出来必然是 deadline 的形状**。同样只有真实实测才暴露。
 
-**如果只看单元测试，这四条一个都不会被发现。**
+第 15、16 条是同一类：**动作本身成功，范围却比预期大**。一个 `checkout` 撤掉的是整份文件，一个 `publish` 没跑就是整次发布缺失，而两者都没有任何报错提示。
+
+**如果只看单元测试，这六条一个都不会被发现。**
 
 ### 硬性要求
 
