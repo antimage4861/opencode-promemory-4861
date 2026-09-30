@@ -245,21 +245,39 @@ function findDeltaEnd(body: string): { end: number; rest: string } {
 /**
  * Start offset of the delta block the writer actually meant.
  *
- * Last occurrence, not first. The writer sometimes emits the marker more than
- * once — captured in test/fixtures, one reply has two opens and a single close,
- * another has three opens and five closes with the whole checkpoint written
- * twice. Taking the first open then made findDeltaEnd pair it with a close that
- * belonged to a *later* block, so everything between them was stripped, taking
- * required sections with it: `## Notes` in one, `## Open` in the other. Both were
- * then rejected by the validator, the watermark stayed put and the host loop
- * stopped after one batch.
+ * Two rules, and the first is the one that mattered.
  *
- * The delta block is a trailing structure — it sits at the end, just before
- * CHECKPOINT_DONE — so the last open is the one that pairs with the final close.
- * For a well-formed reply there is exactly one open and this is identical to the
- * old behaviour.
+ * Line-anchored, mirroring findDeltaEnd. A bare `indexOf(DELTA_OPEN)` matches the
+ * marker inside prose — and the writer does write it in prose whenever the
+ * conversation was itself about this format. A real reply in test/fixtures
+ * contains the line
+ *
+ *   - `src/session/writer-prompt.txt` — 唯一来源；新增 `<!-- project-memory-delta` 块规范
+ *
+ * and the first occurrence sits at that bullet, not at the block. findDeltaEnd
+ * then pairs it with the *real* block's closing marker, and everything between
+ * them is stripped — which took `## Notes` with it. The reply was well formed;
+ * the reader was not. Both fixtures are this case, and neither has a duplicated
+ * block: substring counting over prose that mentions the marker had suggested
+ * otherwise, and a structure listing that only printed line-leading markers had
+ * hidden it.
+ *
+ * Last-wins among line-anchored candidates, so a genuinely repeated block still
+ * resolves to the final one rather than pairing with someone else's close. For a
+ * well-formed reply there is exactly one and this is a no-op.
  */
 function findDeltaStart(reply: string): number {
+  const lines = reply.split("\n")
+  let offset = 0
+  let found = -1
+  for (const line of lines) {
+    if (line.trimStart().startsWith(DELTA_OPEN)) found = offset
+    offset += line.length + 1
+  }
+  if (found >= 0) return found
+  // No line-anchored marker. Fall back to a bare match so a reply that inlines the
+  // open marker on its own line without a newline still parses; without this the
+  // block would leak into the memory file, which is the one outcome to avoid.
   return reply.lastIndexOf(DELTA_OPEN)
 }
 

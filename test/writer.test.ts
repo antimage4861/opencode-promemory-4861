@@ -423,50 +423,77 @@ describe("checkpoint size ceiling", () => {
   })
 })
 
-describe("duplicate delta markers", () => {
+describe("delta marker mentioned in prose", () => {
   // Two real writer replies, captured verbatim. Both were rejected by the
-  // validator, which held the watermark and stopped the host loop after one
-  // batch — 2 of 8 full-budget samples, a 25% failure rate.
+  // validator, which held the watermark and stopped the host loop after one batch.
   //
-  // The writer emitted the delta marker more than once and paired it with a close
-  // belonging to a later block, so everything in between was stripped along with
-  // the required sections. Taking the LAST open marker fixes both; taking the
-  // first is what broke them.
+  // The cause is not what it first looked like. Substring counting reported 2 and 3
+  // open markers, and a structure listing that printed only line-leading markers
+  // showed exactly one each — so "the writer duplicated the block" was the
+  // obvious reading, and it is wrong. Both replies are well formed. They simply
+  // DISCUSS this format, because the conversation they were distilling was about
+  // this plugin, and one contains:
+  //
+  //   - `src/session/writer-prompt.txt` — 唯一来源；新增 `<!-- project-memory-delta` 块规范
+  //
+  // A bare indexOf matched that bullet. findDeltaEnd — which has always required
+  // the closing marker to sit on its own line — then paired it with the real
+  // block's close, and everything between was stripped, taking ## Notes or
+  // ## Open along. The asymmetry between the two searches was the defect.
+  //
+  // So these fixtures guard the line-anchored open, not a duplicate count. The
+  // occurrence count is asserted below so the guard cannot silently stop applying:
+  // if someone "fixes" this by dropping the inline mention, the count drops and
+  // the test says so rather than quietly ceasing to test anything.
   const REQ = ["# Checkpoint", "## Summary", "## Decisions", "## Facts", "## Open", "## Files", "## Notes"]
+  const OPEN = "<!-- project-memory-delta"
 
   function fixture(name: string): string {
     return fs.readFileSync(path.join(import.meta.dir, "fixtures", name), "utf8")
   }
 
-  test("a reply with two opens and one close keeps its required sections", () => {
-    const raw = fixture("malformed-delta-swallowed-notes.md")
-    expect(raw.split("<!-- project-memory-delta").length - 1).toBe(2)
+  const lineAnchored = (raw: string) =>
+    raw.split("\n").filter((l) => l.trimStart().startsWith(OPEN)).length
+
+  test("fixture 1: one real block, marker also mentioned in a bullet", () => {
+    const raw = fixture("inline-delta-marker-in-prose.md")
+    expect(raw.split(OPEN).length - 1).toBe(2)
+    expect(lineAnchored(raw)).toBe(1)
     const body = stripDelta(raw).replace(/CHECKPOINT_DONE\s*$/, "").trim()
     for (const s of REQ) expect(body).toContain(s)
     expect(validateCheckpoint(body).ok).toBe(true)
   })
 
-  test("a reply written twice with three opens keeps its required sections", () => {
-    const raw = fixture("malformed-duplicated-checkpoint.md")
-    expect(raw.split("<!-- project-memory-delta").length - 1).toBe(3)
+  test("fixture 2: one real block, marker mentioned twice in prose", () => {
+    const raw = fixture("inline-delta-marker-in-prose-2.md")
+    expect(raw.split(OPEN).length - 1).toBe(3)
+    expect(lineAnchored(raw)).toBe(1)
     const body = stripDelta(raw).replace(/CHECKPOINT_DONE\s*$/, "").trim()
     for (const s of REQ) expect(body).toContain(s)
     expect(validateCheckpoint(body).ok).toBe(true)
   })
 
-  test("the delta parsed is the last block, not the abandoned draft", () => {
-    const raw = fixture("malformed-delta-swallowed-notes.md")
+  test("the inline mention is not mistaken for the block, and the real block still parses", () => {
+    const raw = fixture("inline-delta-marker-in-prose.md")
     const delta = extractDelta(raw)
     expect(delta).not.toBeNull()
-    // A real parse of the final block: every project section present.
-    for (const key of Object.keys(delta!.project)) {
-      expect(typeof delta!.project[key as keyof typeof delta.project]).toBe("string")
-    }
+    // Parsed from the real block, so its sections carry content. If the inline
+    // mention had won, the bullet text would show up as the block.
+    expect(delta!.project["Project context"].length).toBeGreaterThan(0)
+    expect(delta!.project["Project context"]).not.toContain("writer-prompt.txt")
     expect(delta!.global.length).toBeGreaterThan(0)
   })
 
+  test("prose after the real block is preserved, prose before it is kept", () => {
+    const raw = fixture("inline-delta-marker-in-prose-2.md")
+    const body = stripDelta(raw)
+    // The bullet that mentions the marker sits inside ## Notes, before the block.
+    expect(body).toContain("畸形样本偏移")
+    // Nothing from inside the block leaks into the memory file.
+    expect(body).not.toContain("## Project context")
+  })
+
   test("a well-formed reply behaves exactly as before", () => {
-    // One open marker: lastIndexOf and indexOf agree, so this path must not move.
     const raw = [
       "# Checkpoint",
       "## Summary",
@@ -482,17 +509,26 @@ describe("duplicate delta markers", () => {
       "## Notes",
       "- n",
       "",
-      "<!-- project-memory-delta",
+      OPEN,
       "## Project context",
       "- ctx",
       "-->",
-      "CHECKPOINT_DONE",
-      ].join("\n")
-    expect(raw.split("<!-- project-memory-delta").length - 1).toBe(1)
+        "CHECKPOINT_DONE",
+    ].join("\n")
+      expect(lineAnchored(raw)).toBe(1)
     const body = stripDelta(raw)
     expect(body).toContain("## Notes")
     expect(body).not.toContain("project-memory-delta")
     expect(extractDelta(raw)?.project["Project context"]).toContain("ctx")
+  })
+
+  test("a reply whose only mention is inline falls back rather than leaking the block", () => {
+    // No line-anchored marker at all. The fallback keeps the block out of the
+    // memory file, which is the one outcome that must never regress — even
+    // though the content is really part of the checkpoint.
+    const raw = ["# Checkpoint", "## Summary", "- s mentions " + OPEN, "## Notes", "- n", "CHECKPOINT_DONE"].join("\n")
+    expect(lineAnchored(raw)).toBe(0)
+    expect(stripDelta(raw)).not.toContain("## Project context")
   })
 })
 

@@ -47,6 +47,8 @@ Date: <ISO date>
      ## Global (cross-project facts)
      - one bullet per line
      -->
+   - The opening comment must sit alone on its own line, with nothing before it on that line. Never write the marker inside a bullet or mid-sentence, and never use inline code around it: the host finds the block by matching a whole line, and an inline mention makes it read everything up to the real closing marker as the block. Describe the block in words if you need to ("the delta block", "以下五段"), never by quoting its delimiter.
+   - Write the six sections and the delta block exactly once. Do not restate them, do not append a second copy after CHECKPOINT_DONE, and do not echo any part of this instruction.
    - Use exactly these five headings, spelled as written. Omit any section that has nothing new — do not write "（无）" and do not leave a heading with an empty body.
    - One bullet per line. Never put several bullets on the same line.
    - Write paths, commands and identifiers verbatim. Do NOT escape backslashes, quotes or any other character — this is markdown, not JSON. A Windows path is written exactly as you see it: D:\RMANBAK\opencode-promemory-4861
