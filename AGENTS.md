@@ -29,11 +29,21 @@ release commit 也不例外——历史上 `0.6.4` 的两个 commit（`cd147b1` 
 ### 步骤
 
 ```bash
-npm test                    # 48 pass
+npm test                    # 59 pass
 npm run build               # 必须。dist/ 不会自动重建
 npm run check               # 校验 dist 与 src 一致 + deploy 副本一致 + agent 产物完整
 npm run sync:deploy         # 同步到 D:/RMANBAK/.opencode/plugins/project-memory/
+npm run verify:published    # 发布后验证：registry 上真有这个版本，且产物常量与 src 一致
 ```
+
+**`verify:published` 不是可选的。** `check` 只看本地，而 `npm publish` 本身可以被跳过而没有任何报错——0.6.8 就发生过：release PR 合并了、tarball 打了、内部也核对了，但从未执行 publish，于是 registry 上没有 0.6.8，用户装到的还是上一个版本，而 git 里却有一个 v0.6.8 tag。**没有任何一步会失败。**
+
+它查四件事：版本存在、`dist-tags.latest` 指向它、线上 tarball 的承重常量与 `src` 一致、本地 tag 与 registry 有无缺口。缺口的判定分两级：
+
+- **最新 tag 没有版本，且更早的 tag 有** → **失败**。最近一次发布被跳过，跳号解释不了（跳号是旧版本被取代，不是新版本缺失）
+- **中间某个 tag 没有版本** → 仅提示。跳号是合法策略，0.6.8 被 0.6.9 取代、内容全在其中
+
+**发布流程末尾必须显式执行它**，不能因为「publish 看起来成功了」就跳过——那正是 0.6.8 的失败方式。
 
 ### 发布前必做：从 tarball 内部核对
 
