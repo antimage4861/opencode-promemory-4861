@@ -7,6 +7,7 @@ import { projectMemoryTemplate } from "../src/memory/template.ts"
 import { GLOBAL_CAP, SECTION_CAPS, extractDelta, mergeGlobalMemory, migrateMemoryLayout, normalizeBullets } from "../src/memory/merge.ts"
 import { describeDreamDiff, diffProjectMemory, snapshotProjectMemory } from "../src/session/dream.ts"
 import { validateCheckpoint, SECTION_BUDGET_BYTES } from "../src/session/validator.ts"
+import { stripDelta, extractDelta } from "../src/memory/merge.ts"
 import type { Db } from "../src/memory/db.ts"
 import {
   bumpWriterFail,
@@ -419,6 +420,79 @@ describe("checkpoint size ceiling", () => {
     const ceiling = validateCheckpoint(sized(checkpoint, 24 * 1024 - 1))
     expect(sum).toBeLessThan(24 * 1024)
     expect(ceiling.errors.filter((e) => e.includes("size exceeds"))).toEqual([])
+  })
+})
+
+describe("duplicate delta markers", () => {
+  // Two real writer replies, captured verbatim. Both were rejected by the
+  // validator, which held the watermark and stopped the host loop after one
+  // batch — 2 of 8 full-budget samples, a 25% failure rate.
+  //
+  // The writer emitted the delta marker more than once and paired it with a close
+  // belonging to a later block, so everything in between was stripped along with
+  // the required sections. Taking the LAST open marker fixes both; taking the
+  // first is what broke them.
+  const REQ = ["# Checkpoint", "## Summary", "## Decisions", "## Facts", "## Open", "## Files", "## Notes"]
+
+  function fixture(name: string): string {
+    return fs.readFileSync(path.join(import.meta.dir, "fixtures", name), "utf8")
+  }
+
+  test("a reply with two opens and one close keeps its required sections", () => {
+    const raw = fixture("malformed-delta-swallowed-notes.md")
+    expect(raw.split("<!-- project-memory-delta").length - 1).toBe(2)
+    const body = stripDelta(raw).replace(/CHECKPOINT_DONE\s*$/, "").trim()
+    for (const s of REQ) expect(body).toContain(s)
+    expect(validateCheckpoint(body).ok).toBe(true)
+  })
+
+  test("a reply written twice with three opens keeps its required sections", () => {
+    const raw = fixture("malformed-duplicated-checkpoint.md")
+    expect(raw.split("<!-- project-memory-delta").length - 1).toBe(3)
+    const body = stripDelta(raw).replace(/CHECKPOINT_DONE\s*$/, "").trim()
+    for (const s of REQ) expect(body).toContain(s)
+    expect(validateCheckpoint(body).ok).toBe(true)
+  })
+
+  test("the delta parsed is the last block, not the abandoned draft", () => {
+    const raw = fixture("malformed-delta-swallowed-notes.md")
+    const delta = extractDelta(raw)
+    expect(delta).not.toBeNull()
+    // A real parse of the final block: every project section present.
+    for (const key of Object.keys(delta!.project)) {
+      expect(typeof delta!.project[key as keyof typeof delta.project]).toBe("string")
+    }
+    expect(delta!.global.length).toBeGreaterThan(0)
+  })
+
+  test("a well-formed reply behaves exactly as before", () => {
+    // One open marker: lastIndexOf and indexOf agree, so this path must not move.
+    const raw = [
+      "# Checkpoint",
+      "## Summary",
+      "- s",
+      "## Decisions",
+      "- d",
+      "## Facts",
+      "- f",
+      "## Open",
+      "- o",
+      "## Files",
+      "- a.ts",
+      "## Notes",
+      "- n",
+      "",
+      "<!-- project-memory-delta",
+      "## Project context",
+      "- ctx",
+      "-->",
+      "CHECKPOINT_DONE",
+      ].join("\n")
+    expect(raw.split("<!-- project-memory-delta").length - 1).toBe(1)
+    const body = stripDelta(raw)
+    expect(body).toContain("## Notes")
+    expect(body).not.toContain("project-memory-delta")
+    expect(extractDelta(raw)?.project["Project context"]).toContain("ctx")
   })
 })
 
