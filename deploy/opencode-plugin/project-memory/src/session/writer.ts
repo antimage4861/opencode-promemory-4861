@@ -282,44 +282,50 @@ export async function spawnWriter(deps: WriterDeps, target: WriterTarget, state:
  * Deadline for a child's completion poll, scaled to the size of the increment it
  * was handed and then padded.
  *
- * The original flat 180s was measured when increments were capped at 24KB, and
- * stopped being meaningful once the budget rose to 135K. A 132,497-byte
- * increment then took 490s to distil, so the old ceiling cut the poll off before
- * the child finished writing. The result read as an empty reply, which the
- * caller correctly reports as "produced no output" — a wasted child and a
- * burned retry. With the retry cap at 3, a third failure silences the session
- * for good, so under-budgeting is the expensive direction.
+ * This constant was wrong three times before it was right, and every wrong
+ * version looked reasonable. The reason is worth recording so the next person
+ * does not repeat it: for a long time the measurement chain was broken, so the
+ * numbers being fitted were artifacts of the deadline rather than of the work.
  *
- * 6ms/byte is fitted from four full-budget runs against a live provider:
+ *   0.6.3  2ms/byte, from a 132,497-byte run that "took 208s". That 208s was the
+ *          moment the 180s ceiling cut the poll — not a completion time.
+ *   0.6.4  4ms/byte, from a run that took 490s (3.7ms/byte) — a real completion,
+ *          but a single sample.
+ *   0.6.7  6ms/byte, fitted to 6.01ms/byte from four full-budget runs. Every one
+ *          of those four "finished" 1.1–2.4s past its budget, which is the
+ *          signature of a chain that never reached the work at all: the idle
+ *          branch could not fire (see watchChildCompletion), so every batch
+ *          waited out the full budget and the fit was fitting the budget.
  *
- *   135,082 B → 902.9 s      28,307 B → 260.9 s
- *   133,539 B → 892.5 s       47,253 B → 375.7 s
+ * What the chain actually costs, measured from the child session's own
+ * timestamps — time_updated minus time_created — not from the outer poll:
  *
- * Least squares on the two extreme sizes gives 90.7s + 6.01 ms/byte, which the
- * previous 4ms constant matched almost exactly: (60s + 4n) × 1.5 = 90s + 6.00n.
- * That agreement is the problem, not the vindication. The 1.5 factor was never
- * slack — the original 2ms value came from a 208s reading that was the moment
- * the 180s ceiling cut the poll, so "slack" was budget × budget. Doubling the
- * coefficient to 4 spent what little margin there was, leaving zero, and every
- * one of the four runs finished 1.1–2.4s past its deadline.
+ *   129,144 B →  68s   0.517 ms/byte
+ *   129,144 B → 111s   0.846 ms/byte
+ *   132,000 B →  89s   0.655 ms/byte
  *
- * 6ms gives (60s + 6n) × 1.5 = 90s + 9n: about 45% over the measured 6.01 at full
- * budget, and ~32% at 28KB where the fixed base carries more of the total. Small
- * increments are already comfortable — the old floor was 180s and a 5KB batch
- * needs under a minute.
+ * Mean 0.672, sd 0.135, CV 20.1%, worst/best 1.64x. Two identical 129KB inputs
+ * differed by 63 seconds, so the spread is real provider variance and the
+ * coefficient has to cover the slow end rather than the average.
  *
- * Those runs could be told apart from children that finished early only because
- * the status probe runs before the deadline check and logs `status=busy`. Before
- * that swap a completed-but-missed child and a genuinely cut-off one produced the
- * identical line, so "every batch overran" was uninterpretable.
+ * 1ms/byte gives (60s + n) × 1.5 = 90s + 1.5n. At full budget that is 288s
+ * against a worst observed 111s — 2.6x, well clear of the 1.64x spread. The 60s
+ * base is generous on its own: 11.5s of it is the fitted intercept, and a 5KB
+ * batch needs under a minute. The previous 6ms/byte produced a 1278s ceiling,
+ * which is 11.5x the work — harmless while the idle branch works, but a stuck
+ * child then sat for 21 minutes before anyone noticed.
  *
- * The 60s base covers fixed costs (session create, prompt round-trip, the child's
- * first token) and matches the fitted 90.7s intercept once the 1.5 applies. A
- * child that overruns is still settled rather than abandoned, so the retry cap
- * can observe it and the host loop can continue.
+ * The ceiling is only a backstop now. watchChildCompletion settles the moment the
+ * child leaves the status map, which is what "idle" looks like on this API, so a
+ * healthy batch never approaches this number.
+ *
+ * If this ever looks tight again, check the log line before touching the
+ * constant: `writer child deadline reached … status=busy` means the child was
+ * still in the map when the budget ran out. That status is only meaningful now
+ * that the map is read correctly.
  */
 const CHILD_DEADLINE_BASE_MS = 60_000
-const CHILD_DEADLINE_MS_PER_BYTE = 6
+const CHILD_DEADLINE_MS_PER_BYTE = 1
 const CHILD_DEADLINE_SLACK = 1.5
 
 export function childDeadlineMs(incrementBytes: number): number {

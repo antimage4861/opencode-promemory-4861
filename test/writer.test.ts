@@ -311,51 +311,53 @@ describe("watermark monotonicity", () => {
 })
 
   describe("child deadline scaling", () => {
-    // Fitted from four full-budget runs against a live provider:
-    //   135,082 B → 902.9s    28,307 B → 260.9s
-    //   133,539 B → 892.5s     47,253 B → 375.7s
-    // Least squares on the extremes gives 90.7s + 6.01 ms/byte. All four
-    // finished 1.1–2.4s past a 4ms/byte budget, so that constant had no margin
-    // at all — the "1.5 slack" was never slack, it was budget × budget.
-    const FULL_BUDGET_BYTES = 135_082
-    const FULL_BUDGET_MS = 902_900
-    const SMALL_BYTES = 28_307
-    const SMALL_MS = 260_900
-    /** The rate the two measurements above imply, in ms per byte. */
-    const FITTED_MS_PER_BYTE = 6.01
+    // Measured from the child session's own timestamps (time_updated minus
+    // time_created) on the idle path — not from the outer poll, which for a long
+    // time measured the deadline instead of the work:
+    //   129,144 B →  68s   0.517 ms/byte
+    //   129,144 B → 111s   0.846 ms/byte
+    //   132,000 B →  89s   0.655 ms/byte
+    // Mean 0.672, sd 0.135, CV 20.1%, worst/best 1.64x. Two identical 129KB
+    // inputs differed by 63s, so the spread is real and the coefficient is set
+    // against the slow end rather than the mean.
+    const SAMPLES = [
+      { bytes: 129_144, ms: 68_000 },
+      { bytes: 129_144, ms: 111_000 },
+      { bytes: 132_000, ms: 89_000 },
+    ] as const
+    const SLOWEST_MS = 111_000
+    const CV = 0.201
 
-    test("clears the measured full-budget run with real margin", () => {
-      const budget = childDeadlineMs(FULL_BUDGET_BYTES)
-      // 1.25x is the floor. 4ms/byte produced 900.5s against 902.9s measured —
-      // under the mark, and every run overran.
-      expect(budget).toBeGreaterThanOrEqual(FULL_BUDGET_MS * 1.25)
+    test("clears the slowest measured full-budget run", () => {
+      const budget = childDeadlineMs(132_000)
+      // 1ms/byte gives 288s here, 2.6x the slowest observation. The 1.64x
+      // worst/best spread is what this has to absorb.
+      expect(budget).toBeGreaterThanOrEqual(SLOWEST_MS * 2)
     })
 
-    test("clears both measured points with real margin", () => {
-      // Compared as whole lines, not as per-byte rates. Inverting the formula to
-      // recover a coefficient and comparing that to 6.01 is the wrong question:
-      // the 1.5 factor multiplies the per-byte term, so a 6ms constant already
-      // yields 9ms/byte of budget. The fit is 90.7s + 6.01n and the budget is
-      // 90s + 1.5kn — the margin is the gap between those two lines.
-      for (const [bytes, measuredMs] of [
-        [FULL_BUDGET_BYTES, FULL_BUDGET_MS],
-        [SMALL_BYTES, SMALL_MS],
-      ] as const) {
-        expect(childDeadlineMs(bytes)).toBeGreaterThanOrEqual(measuredMs * 1.25)
+    test("every measured sample fits inside the budget", () => {
+      for (const s of SAMPLES) {
+        expect(childDeadlineMs(s.bytes)).toBeGreaterThan(s.ms)
       }
     })
 
-    test("the budget line stays above the fitted cost line at every size", () => {
-      // 90.7s + 6.01n is the least-squares fit of the four runs. Wherever the
-      // budget falls under it, batches get cut off — which is what 4ms/byte did
-      // at every size, finishing 1.1–2.4s late each time.
-      const fitted = (bytes: number) => 90_700 + FITTED_MS_PER_BYTE * bytes
-      for (const bytes of [0, 24_000, 60_000, 100_000, 135_000, 200_000]) {
-        expect(childDeadlineMs(bytes)).toBeGreaterThan(fitted(bytes))
-      }
+    test("margin absorbs the observed spread, not just the mean", () => {
+      // Guards the specific mistake: setting the coefficient from the mean rate.
+      // At 0.672 ms/byte mean a coefficient tuned to it would leave a fast-looking
+      // budget that the 0.846 sample blows through.
+      const margin = childDeadlineMs(132_000) / SLOWEST_MS
+      expect(margin).toBeGreaterThanOrEqual(1 / (1 + CV) * 2)
+      expect(margin).toBeGreaterThanOrEqual(2)
     })
 
-    test("never drops below the original flat ceiling", () => {
+    test("a stuck child is not left waiting for the old 21 minutes", () => {
+      // The 6ms constant made a full-budget ceiling of 1278s — 11.5x the work.
+      // Harmless while the idle branch fires, but a genuinely stuck child then
+      // sat that long before anything noticed.
+      expect(childDeadlineMs(135_000)).toBeLessThan(300_000)
+    })
+
+  test("never drops below the original flat ceiling", () => {
       // The budget is a ceiling, not a wait: a small increment still settles as
       // soon as the child reports idle. What must never happen is the budget
       // falling under the old flat 180s, which would re-tighten the deadline the
