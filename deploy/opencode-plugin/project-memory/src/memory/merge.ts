@@ -243,10 +243,31 @@ function findDeltaEnd(body: string): { end: number; rest: string } {
 }
 
 /**
+ * Start offset of the delta block the writer actually meant.
+ *
+ * Last occurrence, not first. The writer sometimes emits the marker more than
+ * once — captured in test/fixtures, one reply has two opens and a single close,
+ * another has three opens and five closes with the whole checkpoint written
+ * twice. Taking the first open then made findDeltaEnd pair it with a close that
+ * belonged to a *later* block, so everything between them was stripped, taking
+ * required sections with it: `## Notes` in one, `## Open` in the other. Both were
+ * then rejected by the validator, the watermark stayed put and the host loop
+ * stopped after one batch.
+ *
+ * The delta block is a trailing structure — it sits at the end, just before
+ * CHECKPOINT_DONE — so the last open is the one that pairs with the final close.
+ * For a well-formed reply there is exactly one open and this is identical to the
+ * old behaviour.
+ */
+function findDeltaStart(reply: string): number {
+  return reply.lastIndexOf(DELTA_OPEN)
+}
+
+/**
  * Strip the machine-readable block so it never reaches a memory file.
  */
 export function stripDelta(reply: string): string {
-  const start = reply.indexOf(DELTA_OPEN)
+  const start = findDeltaStart(reply)
   if (start < 0) return reply
   const body = reply.slice(start + DELTA_OPEN.length)
   const { end, rest } = findDeltaEnd(body)
@@ -270,7 +291,10 @@ export function stripDelta(reply: string): string {
  * is valid: the project sections may all be absent.
  */
 export function extractDelta(reply: string): WriterDelta | null {
-  const start = reply.indexOf(DELTA_OPEN)
+  // Same last-wins rule as stripDelta. Parsing the first block would merge a
+  // draft the writer abandoned over the top of the final one — the duplication
+  // the fixtures show makes the earlier block stale, not authoritative.
+  const start = findDeltaStart(reply)
   if (start < 0) return null
   const body = reply.slice(start + DELTA_OPEN.length)
   const { end } = findDeltaEnd(body)
